@@ -70,7 +70,14 @@ Downloaded / burned status is remembered across sessions. Volume labels default 
 
 ## CI / releases
 
-Tag `v0.1.0` publishes binaries via:
+Pushing to `master` only runs build/test CI. Releases with attached binaries are created by the **Release** workflow when you push a version tag (or run it manually via `workflow_dispatch`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Workflows:
 
 - [`.github/workflows/release.yml`](.github/workflows/release.yml)
 - [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml)

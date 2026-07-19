@@ -73,7 +73,8 @@ jobs:
 
   release:
     name: Publish Gitea release
-    needs: [build-linux]
+    needs: [build-linux, build-windows, build-macos]
+    if: ${{ always() && needs.build-linux.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +85,7 @@ jobs:
           mkdir -p upload
           find release-assets -type f -exec cp {} upload/ \;
           ls -la upload
+          test -n "$(find upload -type f | head -n 1)"
       - id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then

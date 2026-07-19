@@ -34,7 +34,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: gog-conjure-macos-aarch64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: gog-conjure-macos-x86_64
 
@@ -74,6 +74,8 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
+    # Publish whatever platforms succeeded; do not require the full matrix.
+    if: ${{ always() && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +86,7 @@ jobs:
           mkdir -p upload
           find release-assets -type f -exec cp {} upload/ \;
           ls -la upload
+          test -n "$(find upload -type f | head -n 1)"
       - id: tag
         shell: bash
         run: |

@@ -277,10 +277,8 @@ unsafe fn first_bstr_from_safearray(psa: *mut SAFEARRAY) -> Option<String> {
     if psa.is_null() {
         return None;
     }
-    let mut lbound = 0i32;
-    let mut ubound = 0i32;
-    SafeArrayGetLBound(psa, 1, &mut lbound).ok()?;
-    SafeArrayGetUBound(psa, 1, &mut ubound).ok()?;
+    let lbound = SafeArrayGetLBound(psa, 1).ok()?;
+    let ubound = SafeArrayGetUBound(psa, 1).ok()?;
     if ubound < lbound {
         return None;
     }
@@ -368,7 +366,7 @@ unsafe fn stream_to_file(
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), BurnError> {
     let mut pos = 0u64;
-    let _ = stream.Seek(0, STREAM_SEEK_SET, Some(&mut pos));
+    let _ = stream.Seek(0, STREAM_SEEK_SET, Some(&mut pos as *mut u64));
 
     let mut file = File::create(iso_path).map_err(|e| {
         BurnError::Other(format!(
@@ -382,7 +380,11 @@ unsafe fn stream_to_file(
     loop {
         check_cancel(cancel).map_err(BurnError::Other)?;
         let mut read = 0u32;
-        let hr = stream.Read(buf.as_mut_ptr().cast(), buf.len() as u32, Some(&mut read));
+        let hr = stream.Read(
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            Some(&mut read as *mut u32),
+        );
         if read == 0 {
             if hr.is_err() {
                 return Err(BurnError::Other(format!("IStream::Read failed: {hr:?}")));
