@@ -1,0 +1,39 @@
+[package]
+name = "gog-conjure"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform GOG library downloader with a distinctive desktop UI"
+license = "MIT"
+repository = "https://github.com/example/gog-conjure"
+readme = "README.md"
+
+[dependencies]
+eframe = { version = "0.31", default-features = true, features = ["default_fonts", "wayland", "x11"] }
+egui = "0.31"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time", "rt", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+url = "2"
+futures-util = "0.3"
+bytes = "1"
+open = "5"
+parking_lot = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+sanitize-filename = "0.6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# Login window runs in a child process (`--gog-login`) so it cannot kill the egui UI.
+wry = "0.50"
+tao = "0.32"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
