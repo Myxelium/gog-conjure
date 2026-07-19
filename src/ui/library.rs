@@ -14,6 +14,7 @@ pub struct LibraryActions {
     pub select_all_filtered: bool,
     pub clear_checks: bool,
     pub queue_checked: bool,
+    pub download_and_burn: bool,
 }
 
 impl LibraryPanel {
@@ -30,6 +31,7 @@ impl LibraryPanel {
             select_all_filtered: false,
             clear_checks: false,
             queue_checked: false,
+            download_and_burn: false,
         };
 
         ui.heading("Library");
@@ -67,6 +69,15 @@ impl LibraryPanel {
                 .clicked()
             {
                 actions.queue_checked = true;
+            }
+            if ui
+                .add_enabled(can_queue, egui::Button::new("Download & add to burn"))
+                .on_hover_text(
+                    "Download all files for checked games and add them to the Burn list",
+                )
+                .clicked()
+            {
+                actions.download_and_burn = true;
             }
         });
         ui.separator();

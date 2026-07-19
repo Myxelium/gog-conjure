@@ -1,7 +1,28 @@
+# Rust build output
 /target/
+/.cargo-target/
 **/*.rs.bk
+
+# Local temp / scratch
+.tmp/
+*.iso
+
+# Bundled burn tools (optional local copies)
+/vendor/
+
+# IDE / editor
 .idea/
 .vscode/
 *.swp
-.env
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+Desktop.ini
+
+# Env / secrets
+.env
+.env.*
+!.env.example

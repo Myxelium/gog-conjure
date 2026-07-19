@@ -1,14 +1,20 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 
 use eframe::egui;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::auth::{self, AuthState, LoginOutcome};
 use crate::config::AppConfig;
-use crate::disc::{scan_download_root, suggest_pack, DiscMedia, DiscPack};
-use crate::download::{DownloadQueue, QueueEvent, QueueItem};
+use crate::disc::{
+    create_burner, folder_size, install_xorriso, list_available_downloads, plan_into_discs,
+    AvailableDownload, BurnEvent, BurnHistory, BurnListEntry, BurnOptions, BurnPlan, DiscBurner,
+    DiscBurnStatus, DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive, PackageManager,
+    SplitPolicy,
+};
+use crate::download::{game_folder, DownloadQueue, JobStatus, QueueEvent, QueueItem};
 use crate::gog::{DownloadFile, GameDetails, GogClient, LibraryGame};
 use crate::images::ImageCache;
 use crate::theme;
@@ -33,7 +39,9 @@ enum AsyncMsg {
         ok: usize,
         failed: usize,
         errors: Vec<String>,
+        add_to_burn: bool,
     },
+    XorrisoInstall(Result<String, String>),
 }
 
 pub struct ConjureApp {
@@ -60,8 +68,24 @@ pub struct ConjureApp {
     queue: DownloadQueue,
     queue_items: Vec<QueueItem>,
     queue_rx: tokio_mpsc::UnboundedReceiver<QueueEvent>,
-    burn_media: DiscMedia,
-    burn_pack: Option<DiscPack>,
+    burn_split: SplitPolicy,
+    burn_list: Vec<BurnListEntry>,
+    burn_plan: BurnPlan,
+    burn_new_media: DiscMedia,
+    burn_default_options: BurnOptions,
+    burn_history: BurnHistory,
+    burn_available: Vec<AvailableDownload>,
+    burn_available_filter: String,
+    burner: Box<dyn DiscBurner>,
+    burn_drives: Vec<OpticalDrive>,
+    burn_rx: Option<tokio_mpsc::UnboundedReceiver<BurnEvent>>,
+    burn_cancel: Option<Arc<AtomicBool>>,
+    burn_active_disc: Option<usize>,
+    burn_log: String,
+    burn_progress: Option<f32>,
+    burn_progress_text: String,
+    burn_was_simulate: bool,
+    installing_xorriso: bool,
 }
 
 impl ConjureApp {
@@ -80,6 +104,13 @@ impl ConjureApp {
         let (async_tx, async_rx) = tokio_mpsc::unbounded_channel();
         let (queue_tx, queue_rx) = tokio_mpsc::unbounded_channel();
         let queue = DownloadQueue::new(config.max_concurrent_downloads, queue_tx);
+
+        let burner = create_burner();
+        let burn_drives = burner.list_drives().unwrap_or_default();
+        let mut burn_default_options = BurnOptions::default();
+        if let Some(first) = burn_drives.first() {
+            burn_default_options.drive = first.path.clone();
+        }
 
         let mut app = Self {
             runtime,
@@ -105,9 +136,27 @@ impl ConjureApp {
             queue,
             queue_items: Vec::new(),
             queue_rx,
-            burn_media: DiscMedia::Bd25,
-            burn_pack: None,
+            burn_split: SplitPolicy::WhenOversized,
+            burn_list: Vec::new(),
+            burn_plan: BurnPlan::default(),
+            burn_new_media: DiscMedia::default_for_new(),
+            burn_default_options,
+            burn_history: BurnHistory::load(),
+            burn_available: Vec::new(),
+            burn_available_filter: String::new(),
+            burner,
+            burn_drives,
+            burn_rx: None,
+            burn_cancel: None,
+            burn_active_disc: None,
+            burn_log: String::new(),
+            burn_progress: None,
+            burn_progress_text: String::new(),
+            burn_was_simulate: false,
+            installing_xorriso: false,
         };
+
+        app.refresh_available_downloads();
 
         if app.auth.is_logged_in() {
             app.refresh_library();
@@ -250,8 +299,137 @@ impl ConjureApp {
         self.enqueue_game_files(game_id, title, files);
     }
 
+    fn add_to_burn_list(&mut self, game_id: u64, title: String) {
+        let Some(root) = self.config.download_root.clone() else {
+            return;
+        };
+        let folder = game_folder(&root, &title);
+        let size = if folder.is_dir() {
+            folder_size(&folder)
+        } else {
+            0
+        };
+        self.burn_history.remember_download(game_id, title.clone());
+        let _ = self.burn_history.save();
+
+        if let Some(existing) = self
+            .burn_list
+            .iter_mut()
+            .find(|e| e.game_id == game_id || (game_id == 0 && e.title == title))
+        {
+            existing.game_id = if game_id != 0 { game_id } else { existing.game_id };
+            existing.title = title;
+            existing.folder = folder;
+            existing.size_bytes = size;
+            existing.included = true;
+        } else {
+            self.burn_list.push(BurnListEntry {
+                game_id,
+                title,
+                folder,
+                size_bytes: size,
+                readiness: DownloadReadiness::Pending,
+                split_override: None,
+                included: true,
+            });
+        }
+        self.refresh_burn_readiness();
+        self.refresh_available_downloads();
+    }
+
+    fn add_available_to_burn_list(&mut self, index: usize) {
+        let Some(game) = self.burn_available.get(index).cloned() else {
+            return;
+        };
+        self.add_to_burn_list(game.game_id, game.title);
+        // Already-downloaded folders should show Ready immediately.
+        if let Some(entry) = self
+            .burn_list
+            .iter_mut()
+            .find(|e| e.game_id == game.game_id || e.folder == game.folder)
+        {
+            entry.folder = game.folder;
+            entry.size_bytes = game.size_bytes;
+            if game.size_bytes > 0 {
+                entry.readiness = DownloadReadiness::Ready;
+            }
+        }
+        self.status = "Added to burn list.".into();
+    }
+
+    fn refresh_available_downloads(&mut self) {
+        let root = self
+            .config
+            .download_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let library: Vec<(u64, String)> = self
+            .library
+            .iter()
+            .map(|g| (g.id, g.title.clone()))
+            .collect();
+        let on_list: HashSet<u64> = self.burn_list.iter().map(|e| e.game_id).collect();
+        self.burn_available =
+            list_available_downloads(&root, &library, &self.burn_history, &on_list);
+        // Also mark on_burn_list by title/folder when game_id is 0.
+        for avail in &mut self.burn_available {
+            if !avail.on_burn_list {
+                avail.on_burn_list = self.burn_list.iter().any(|e| {
+                    e.folder == avail.folder
+                        || (e.title.eq_ignore_ascii_case(&avail.title))
+                });
+            }
+            if avail.game_id != 0 {
+                avail.burned = self.burn_history.is_burned(avail.game_id);
+            }
+        }
+    }
+
+    fn refresh_burn_readiness(&mut self) {
+        let mut history_dirty = false;
+        for entry in &mut self.burn_list {
+            let jobs: Vec<_> = self
+                .queue_items
+                .iter()
+                .filter(|j| j.game_id == entry.game_id)
+                .collect();
+
+            let readiness = if jobs
+                .iter()
+                .any(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running))
+            {
+                DownloadReadiness::Downloading
+            } else if jobs.iter().any(|j| j.status == JobStatus::Failed)
+                && !jobs.iter().any(|j| j.status == JobStatus::Completed)
+            {
+                DownloadReadiness::Failed
+            } else if entry.folder.is_dir() && folder_size(&entry.folder) > 0 {
+                DownloadReadiness::Ready
+            } else if jobs.iter().all(|j| j.status == JobStatus::Completed) && !jobs.is_empty() {
+                DownloadReadiness::Ready
+            } else if jobs.is_empty() {
+                DownloadReadiness::Pending
+            } else {
+                DownloadReadiness::Pending
+            };
+
+            entry.readiness = readiness;
+            if entry.folder.is_dir() {
+                entry.size_bytes = folder_size(&entry.folder);
+            }
+            if readiness == DownloadReadiness::Ready {
+                self.burn_history
+                    .remember_download(entry.game_id, entry.title.clone());
+                history_dirty = true;
+            }
+        }
+        if history_dirty {
+            let _ = self.burn_history.save();
+        }
+    }
+
     /// Fetch details for every checked game and queue all installers + extras.
-    fn queue_checked_games(&mut self) {
+    fn queue_checked_games(&mut self, add_to_burn: bool) {
         if self.checked_games.is_empty() || self.batch_queueing {
             return;
         }
@@ -269,6 +447,12 @@ impl ConjureApp {
 
         if jobs.is_empty() {
             return;
+        }
+
+        if add_to_burn {
+            for (game_id, title) in &jobs {
+                self.add_to_burn_list(*game_id, title.clone());
+            }
         }
 
         self.batch_queueing = true;
@@ -314,8 +498,208 @@ impl ConjureApp {
                 }
             }
 
-            let _ = tx.send(AsyncMsg::BatchQueued { ok, failed, errors });
+            let _ = tx.send(AsyncMsg::BatchQueued {
+                ok,
+                failed,
+                errors,
+                add_to_burn,
+            });
         });
+    }
+
+    fn plan_burn_discs(&mut self) {
+        self.refresh_burn_readiness();
+        if self.burn_plan.discs.is_empty() {
+            self.status = "Add at least one disc before planning.".into();
+            return;
+        }
+        // Preserve disc shells (media + options + manual volids).
+        let shells = self.burn_plan.discs.clone();
+        let plan = plan_into_discs(shells, &self.burn_list, self.burn_split);
+        let filled = plan.discs.iter().filter(|d| !d.units.is_empty()).count();
+        let warnings = plan.warnings.len();
+        let blockers = plan.blockers.len();
+        self.burn_plan = plan;
+        self.status = format!(
+            "Planned {filled} filled disc(s){}{}",
+            if warnings > 0 {
+                format!(" · {warnings} notice(s)")
+            } else {
+                String::new()
+            },
+            if blockers > 0 {
+                format!(" · {blockers} blocker(s)")
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    fn add_burn_disc(&mut self) {
+        let index = self.burn_plan.discs.len();
+        let mut options = self.burn_default_options.clone();
+        if options.drive.is_empty() {
+            if let Some(first) = self.burn_drives.first() {
+                options.drive = first.path.clone();
+            }
+        }
+        self.burn_plan
+            .discs
+            .push(DiscLayout::new_empty(index, self.burn_new_media, options));
+        self.status = format!(
+            "Added disc {} ({})",
+            index + 1,
+            self.burn_new_media.short_label()
+        );
+    }
+
+    fn remove_burn_disc(&mut self, index: usize) {
+        if self.burn_rx.is_some() {
+            self.status = "Cannot remove a disc while burning.".into();
+            return;
+        }
+        if index >= self.burn_plan.discs.len() {
+            return;
+        }
+        self.burn_plan.discs.remove(index);
+        for (i, disc) in self.burn_plan.discs.iter_mut().enumerate() {
+            disc.index = i;
+        }
+        self.status = "Disc removed.".into();
+    }
+
+    fn start_xorriso_install(&mut self) {
+        if self.installing_xorriso {
+            return;
+        }
+        self.installing_xorriso = true;
+        self.status =
+            "Installing xorriso… approve the system password prompt if one appears.".into();
+        let tx = self.async_tx.clone();
+        self.runtime.spawn(async move {
+            // Package managers + pkexec are blocking; keep the UI responsive.
+            let result = tokio::task::spawn_blocking(install_xorriso)
+                .await
+                .unwrap_or_else(|e| Err(format!("install task failed: {e}")));
+            let _ = tx.send(AsyncMsg::XorrisoInstall(result));
+        });
+    }
+
+    fn refresh_burn_drives(&mut self) {
+        match self.burner.list_drives() {
+            Ok(drives) => {
+                self.burn_drives = drives;
+                if self.burn_default_options.drive.is_empty()
+                    || !self
+                        .burn_drives
+                        .iter()
+                        .any(|d| d.path == self.burn_default_options.drive)
+                {
+                    if let Some(first) = self.burn_drives.first() {
+                        self.burn_default_options.drive = first.path.clone();
+                    }
+                }
+                for disc in &mut self.burn_plan.discs {
+                    if disc.options.drive.is_empty()
+                        || !self
+                            .burn_drives
+                            .iter()
+                            .any(|d| d.path == disc.options.drive)
+                    {
+                        if let Some(first) = self.burn_drives.first() {
+                            disc.options.drive = first.path.clone();
+                        }
+                    }
+                }
+                self.status = format!("Found {} optical drive(s).", self.burn_drives.len());
+            }
+            Err(err) => {
+                self.burn_drives.clear();
+                self.status = format!("Could not list drives: {err}");
+            }
+        }
+    }
+
+    fn start_disc_burn(&mut self, disc_index: usize) {
+        if self.burn_rx.is_some() {
+            self.status = "A burn is already in progress.".into();
+            return;
+        }
+        if !self.burn_plan.blockers.is_empty() {
+            self.status = "Cannot burn while the plan has blockers.".into();
+            return;
+        }
+        let Some(disc) = self.burn_plan.discs.get(disc_index).cloned() else {
+            return;
+        };
+        if disc.units.is_empty() {
+            self.status = "Disc is empty — Plan first.".into();
+            return;
+        }
+
+        for unit in &disc.units {
+            let ready = self
+                .burn_list
+                .iter()
+                .find(|e| e.game_id == unit.game_id || e.title == unit.game_title)
+                .map(|e| e.readiness == DownloadReadiness::Ready)
+                .unwrap_or_else(|| {
+                    // Available download only — treat existing folder as ready.
+                    true
+                });
+            if !ready {
+                self.status = format!(
+                    "Cannot burn: '{}' download is not complete.",
+                    unit.game_title
+                );
+                return;
+            }
+        }
+
+        let mut folders: Vec<(u64, PathBuf)> = self
+            .burn_list
+            .iter()
+            .map(|e| (e.game_id, e.folder.clone()))
+            .collect();
+        // Include available download folders for games not on list matching.
+        for avail in &self.burn_available {
+            if !folders.iter().any(|(id, p)| *id == avail.game_id || p == &avail.folder) {
+                folders.push((avail.game_id, avail.folder.clone()));
+            }
+        }
+
+        let options = disc.options.clone();
+        if let Err(err) = self.burner.build_burn_command(&disc, &options, &folders) {
+            self.status = format!("Cannot start burn: {err}");
+            return;
+        }
+
+        if let Some(d) = self.burn_plan.discs.get_mut(disc_index) {
+            d.status = DiscBurnStatus::Burning;
+            d.last_error = None;
+        }
+
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.burn_rx = Some(rx);
+        self.burn_cancel = Some(cancel.clone());
+        self.burn_active_disc = Some(disc_index);
+        self.burn_log.clear();
+        self.burn_progress = Some(0.02);
+        self.burn_progress_text = if options.simulate {
+            "Simulating…".into()
+        } else {
+            "Starting burn…".into()
+        };
+        self.burn_was_simulate = options.simulate;
+        self.status = if options.simulate {
+            format!("Simulating disc {}…", disc_index + 1)
+        } else {
+            format!("Burning disc {}…", disc_index + 1)
+        };
+
+        self.burner
+            .start_burn_job(&disc, &options, &folders, tx, cancel);
     }
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
@@ -325,6 +709,7 @@ impl ConjureApp {
                     self.library = games;
                     self.loading_library = false;
                     self.status = format!("Loaded {} games.", self.library.len());
+                    self.refresh_available_downloads();
                 }
                 AsyncMsg::Library(Err(err)) => {
                     self.loading_library = false;
@@ -364,8 +749,27 @@ impl ConjureApp {
                     }
                     Err(_) => self.images.mark_failed(&url),
                 },
-                AsyncMsg::BatchQueued { ok, failed, errors } => {
+                AsyncMsg::XorrisoInstall(result) => {
+                    self.installing_xorriso = false;
+                    match result {
+                        Ok(msg) => {
+                            self.burner = create_burner();
+                            self.refresh_burn_drives();
+                            self.status = msg;
+                        }
+                        Err(err) => {
+                            self.status = format!("xorriso install failed: {err}");
+                        }
+                    }
+                }
+                AsyncMsg::BatchQueued {
+                    ok,
+                    failed,
+                    errors,
+                    add_to_burn,
+                } => {
                     self.batch_queueing = false;
+                    self.refresh_burn_readiness();
                     if failed == 0 {
                         self.status = format!("Queued all files for {ok} game(s).");
                     } else {
@@ -380,7 +784,7 @@ impl ConjureApp {
                         );
                     }
                     if ok > 0 {
-                        self.tab = Tab::Queue;
+                        self.tab = if add_to_burn { Tab::Burn } else { Tab::Queue };
                     }
                 }
             }
@@ -414,32 +818,86 @@ impl ConjureApp {
             }
         }
         let live = self.queue.items();
-        if !live.is_empty() || self.queue_items.iter().any(|i| {
-            matches!(
-                i.status,
-                crate::download::JobStatus::Queued | crate::download::JobStatus::Running
-            )
-        }) {
+        if !live.is_empty()
+            || self.queue_items.iter().any(|i| {
+                matches!(i.status, JobStatus::Queued | JobStatus::Running)
+            })
+        {
             self.queue_items = live;
         }
-    }
+        self.refresh_burn_readiness();
 
-    fn suggest_burn_pack(&mut self) {
-        let Some(root) = self.config.download_root.clone() else {
-            self.status = "Choose a download folder first.".into();
-            return;
-        };
-        match scan_download_root(&root) {
-            Ok(candidates) => {
-                if candidates.is_empty() {
-                    self.status = "No game folders found under the download root yet.".into();
-                    self.burn_pack = None;
-                } else {
-                    self.burn_pack = Some(suggest_pack(self.burn_media, candidates));
-                    self.status = "Suggested a disc pack from downloaded games.".into();
+        let mut burn_finished: Option<Result<(), String>> = None;
+        if let Some(rx) = &mut self.burn_rx {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    BurnEvent::Log(line) => {
+                        if !self.burn_log.is_empty() {
+                            self.burn_log.push('\n');
+                        }
+                        self.burn_log.push_str(&line);
+                        if self.burn_log.len() > 32_000 {
+                            let keep = self.burn_log.split_off(self.burn_log.len() - 24_000);
+                            self.burn_log = keep;
+                        }
+                    }
+                    BurnEvent::Progress { fraction, message } => {
+                        self.burn_progress = Some(fraction);
+                        self.burn_progress_text = message.clone();
+                        if !self.burn_log.is_empty() {
+                            self.burn_log.push('\n');
+                        }
+                        self.burn_log.push_str(&message);
+                    }
+                    BurnEvent::Finished(result) => {
+                        burn_finished = Some(result);
+                    }
                 }
             }
-            Err(err) => self.status = format!("Could not scan download root: {err}"),
+        }
+
+        if let Some(result) = burn_finished {
+            let disc_index = self.burn_active_disc;
+            let was_simulate = self.burn_was_simulate;
+            self.burn_rx = None;
+            self.burn_cancel = None;
+            self.burn_active_disc = None;
+            self.burn_was_simulate = false;
+            if let Some(idx) = disc_index {
+                if let Some(disc) = self.burn_plan.discs.get_mut(idx) {
+                    match &result {
+                        Ok(()) => {
+                            disc.status = DiscBurnStatus::Done;
+                            disc.last_error = None;
+                            self.burn_progress = Some(1.0);
+                            self.burn_progress_text = if was_simulate {
+                                "Simulate finished.".into()
+                            } else {
+                                "Burn finished.".into()
+                            };
+                            if was_simulate {
+                                self.status = format!(
+                                    "Disc {} simulate OK (no disc was written).",
+                                    idx + 1
+                                );
+                            } else {
+                                let game_ids: Vec<u64> =
+                                    disc.units.iter().map(|u| u.game_id).collect();
+                                self.status = format!("Disc {} burned successfully.", idx + 1);
+                                self.burn_history.mark_burned(game_ids);
+                                let _ = self.burn_history.save();
+                                self.refresh_available_downloads();
+                            }
+                        }
+                        Err(err) => {
+                            disc.status = DiscBurnStatus::Failed;
+                            disc.last_error = Some(err.clone());
+                            self.burn_progress_text = "Failed.".into();
+                            self.status = format!("Disc {} burn failed: {err}", idx + 1);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -529,6 +987,7 @@ impl eframe::App for ConjureApp {
             Tab::Library => {
                 let mut image_requests = Vec::new();
                 let mut queue_checked = false;
+                let mut download_and_burn = false;
                 let mut select_all = false;
                 let mut clear_checks = false;
 
@@ -560,6 +1019,7 @@ impl eframe::App for ConjureApp {
                         select_all = actions.select_all_filtered;
                         clear_checks = actions.clear_checks;
                         queue_checked = actions.queue_checked;
+                        download_and_burn = actions.download_and_burn;
 
                         if self.selected_game != prev {
                             if let Some(id) = self.selected_game {
@@ -606,7 +1066,10 @@ impl eframe::App for ConjureApp {
                     self.checked_games.clear();
                 }
                 if queue_checked {
-                    self.queue_checked_games();
+                    self.queue_checked_games(false);
+                }
+                if download_and_burn {
+                    self.queue_checked_games(true);
                 }
             }
             Tab::Queue => {
@@ -631,15 +1094,68 @@ impl eframe::App for ConjureApp {
             }
             Tab::Burn => {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut suggest = false;
-                    BurnPanel::show(
+                    let unavailable = self.burner.unavailable_reason();
+                    let burning = self.burn_rx.is_some();
+                    let pkg = PackageManager::detect();
+                    let can_install = cfg!(target_os = "linux")
+                        && !self.burner.is_available()
+                        && pkg.is_some()
+                        && !self.installing_xorriso;
+                    let install_hint = pkg.as_ref().map(|m| m.short_command());
+                    let actions = BurnPanel::show(
                         ui,
-                        &mut self.burn_media,
-                        &self.burn_pack,
-                        &mut || suggest = true,
+                        &self.burn_available,
+                        &mut self.burn_available_filter,
+                        &mut self.burn_new_media,
+                        &mut self.burn_split,
+                        &mut self.burn_list,
+                        &mut self.burn_plan,
+                        &self.burn_drives,
+                        self.burner.name(),
+                        self.burner.is_available(),
+                        unavailable.as_deref(),
+                        burning,
+                        self.burn_active_disc,
+                        &self.burn_log,
+                        self.burn_progress,
+                        &self.burn_progress_text,
+                        self.installing_xorriso,
+                        can_install,
+                        install_hint.as_deref(),
                     );
-                    if suggest {
-                        self.suggest_burn_pack();
+
+                    if actions.install_xorriso {
+                        self.start_xorriso_install();
+                    }
+                    if actions.refresh_available {
+                        self.refresh_available_downloads();
+                    }
+                    if actions.add_disc {
+                        self.add_burn_disc();
+                    }
+                    if actions.plan {
+                        self.plan_burn_discs();
+                    }
+                    if actions.clear_list {
+                        self.burn_list.clear();
+                        self.refresh_available_downloads();
+                        self.status = "Burn list cleared.".into();
+                    }
+                    if actions.refresh_drives {
+                        self.refresh_burn_drives();
+                    }
+                    if let Some(game_id) = actions.remove_from_list {
+                        self.burn_list.retain(|e| e.game_id != game_id);
+                        self.refresh_available_downloads();
+                    }
+                    if let Some(idx) = actions.add_available {
+                        self.add_available_to_burn_list(idx);
+                    }
+                    if let Some(idx) = actions.remove_disc {
+                        self.remove_burn_disc(idx);
+                    }
+                    if let Some(idx) = actions.burn_disc {
+                        self.start_disc_burn(idx);
                     }
                 });
             }
