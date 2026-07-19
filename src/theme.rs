@@ -3,11 +3,25 @@
 
 use egui::{FontFamily, FontId, Stroke, Style, TextStyle, Visuals};
 
+/// Canonical interactive control height. All standard buttons share this.
+pub const BTN_HEIGHT: f32 = 28.0;
+
+/// Fixed-width side-column actions (Add / Remove / Clear / Refresh).
+pub const SIDE_BTN: egui::Vec2 = egui::vec2(72.0, BTN_HEIGHT);
+
+/// Primary CTA width (Burn / Reburn); height matches [`BTN_HEIGHT`].
+pub const PRIMARY_BTN: egui::Vec2 = egui::vec2(100.0, BTN_HEIGHT);
+
+/// Hero splash login button.
+pub const HERO_BTN: egui::Vec2 = egui::vec2(220.0, 40.0);
+
 pub fn apply(ctx: &egui::Context) {
     let mut style = Style::default();
 
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 6.0);
+    // Min height for buttons, sliders, combo boxes — keeps rows aligned.
+    style.spacing.interact_size = egui::vec2(40.0, BTN_HEIGHT);
     style.spacing.window_margin = egui::Margin::same(16);
     style.visuals = visuals();
 

@@ -43,13 +43,19 @@ Click **Login with GOG**, sign in in the popup, done.
 
 ## Disc burn
 
-On the **Library** tab, check games and use **Download & add to burn**. Already-downloaded games (and previously burned ones) also show on the **Burn** tab so you can add or re-add them anytime.
+On the **Library** tab, check games and use **Download** / **Download selected**, or **Plan** for a simplified disc flow:
+
+1. **Plan** opens a modal: pick one media size for every disc, filter by OS / language / extras, and choose download now or later
+2. The estimate uses **GOG file sizes** (downloads do not need to be finished yet) and shows how many identical discs you need
+3. **Add to burn** creates those discs on the Burn tab (and optionally queues the filtered downloads)
+
+Already-downloaded games (and previously burned ones) also show on the **Burn** tab so you can add or re-add them anytime.
 
 Then on **Burn**:
 
-1. Add games to the burn list from **Downloaded** (or the Library action)
+1. Add games to the burn list from **Downloaded** (or the Library actions)
 2. **Add disc** for each blank you have — each disc can use a different media size and its own burn settings
-3. **Plan** — packs the burn list onto your discs as efficiently as possible (optional GOG installer bin splitting)
+3. **Plan** — packs the burn list onto your discs as efficiently as possible using GOG/file sizes (optional GOG installer bin splitting). Incomplete downloads are included in the layout; **Burn** stays disabled until those downloads finish
 4. Click **Burn** on each disc when ready (reburn allowed if a write fails)
 
 Downloaded / burned status is remembered across sessions. Volume labels default to truncated game titles (ISO 9660, 32 characters).

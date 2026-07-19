@@ -412,4 +412,42 @@ mod tests {
         assert_eq!(parse_human_size("1.5 GB"), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
         assert_eq!(parse_human_size("800 MB"), 800 * 1024 * 1024);
     }
+
+    #[test]
+    fn parses_multiple_language_download_blocks() {
+        let value = json!({
+            "title": "Multi Lang Game",
+            "downloads": [
+                ["English", { "windows": [{
+                    "name": "setup_en.exe", "size": "100 MB",
+                    "manualUrl": "/downlink/game/setup_en.exe"
+                }]}],
+                ["Deutsch", { "windows": [{
+                    "name": "setup_de.exe", "size": "100 MB",
+                    "manualUrl": "/downlink/game/setup_de.exe"
+                }], "linux": [{
+                    "name": "setup_de.sh", "size": "90 MB",
+                    "manualUrl": "/downlink/game/setup_de.sh"
+                }]}],
+                ["français", { "windows": [{
+                    "name": "setup_fr.exe", "size": "100 MB",
+                    "manualUrl": "/downlink/game/setup_fr.exe"
+                }]}]
+            ],
+            "extras": []
+        });
+        let details = GameDetails::from_json(1, value).unwrap();
+        let langs: std::collections::BTreeSet<_> = details
+            .installers
+            .iter()
+            .filter_map(|f| f.language.as_deref())
+            .collect();
+        assert_eq!(
+            langs,
+            ["Deutsch", "English", "français"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(details.installers.len(), 4);
+    }
 }

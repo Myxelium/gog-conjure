@@ -5,7 +5,7 @@ use super::history::{AvailableDownload, BurnHistory};
 use super::media::DiscMedia;
 use super::models::{
     BurnFile, BurnListEntry, BurnOptions, BurnPlan, BurnUnit, DiscBurnStatus, DiscLayout,
-    DownloadReadiness, SplitPolicy,
+    DownloadReadiness, PlannedFile, SplitPolicy,
 };
 use super::volid::auto_volid;
 
@@ -13,6 +13,7 @@ use super::volid::auto_volid;
 ///
 /// Existing disc media/options/manual volids are preserved. Contents are redistributed.
 /// Games that do not fit are reported in `warnings` / `blockers`.
+/// Planning uses GOG/planned sizes when downloads are not finished yet.
 pub fn plan_into_discs(
     mut discs: Vec<DiscLayout>,
     entries: &[BurnListEntry],
@@ -36,43 +37,8 @@ pub fn plan_into_discs(
         .max()
         .unwrap_or(0);
 
-    let mut chains: Vec<Vec<BurnUnit>> = Vec::new();
-    let mut loose: Vec<BurnUnit> = Vec::new();
-
-    for entry in entries.iter().filter(|e| e.included) {
-        if entry.readiness != DownloadReadiness::Ready {
-            warnings.push(format!(
-                "{}: skipped — download not complete ({})",
-                entry.title,
-                entry.readiness.label()
-            ));
-            continue;
-        }
-        if !entry.folder.is_dir() {
-            blockers.push(format!("{}: folder missing", entry.title));
-            continue;
-        }
-
-        let policy = entry.effective_split(global_split);
-        // Prefer splitting against the smallest disc that could still hold a chunk,
-        // but use max capacity so a game is only "oversized" if it exceeds every disc.
-        let split_cap = match policy {
-            SplitPolicy::WhenOversized | SplitPolicy::AllowToPack => {
-                // Chunk against the largest disc so parts can land on any disc size ≤ max.
-                // Placement still respects each disc's own capacity.
-                max_cap
-            }
-            SplitPolicy::Never => max_cap,
-        };
-
-        match resolve_game(entry, policy, split_cap) {
-            Ok(units) if units.len() == 1 && !units[0].is_split() => {
-                loose.push(units.into_iter().next().unwrap());
-            }
-            Ok(units) => chains.push(units),
-            Err(msg) => blockers.push(msg),
-        }
-    }
+    let (chains, mut loose) =
+        collect_units(entries, global_split, max_cap, &mut blockers, &mut warnings);
 
     // Clear contents; keep media, options, manual volid.
     for disc in &mut discs {
@@ -158,6 +124,71 @@ pub fn plan_into_discs(
     }
 }
 
+/// Pack included games onto as many same-size discs as needed.
+pub fn plan_homogeneous_discs(
+    media: DiscMedia,
+    entries: &[BurnListEntry],
+    global_split: SplitPolicy,
+    options: BurnOptions,
+) -> BurnPlan {
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    let capacity = media.capacity_bytes();
+    let (chains, loose) = collect_units(entries, global_split, capacity, &mut blockers, &mut warnings);
+
+    if chains.is_empty() && loose.is_empty() {
+        return BurnPlan {
+            discs: Vec::new(),
+            blockers,
+            warnings,
+        };
+    }
+
+    let mut discs = pack_units(media, capacity, chains, loose);
+    for disc in &mut discs {
+        disc.options = options.clone();
+    }
+    assign_volids(&mut discs);
+
+    BurnPlan {
+        discs,
+        blockers,
+        warnings,
+    }
+}
+
+fn collect_units(
+    entries: &[BurnListEntry],
+    global_split: SplitPolicy,
+    split_cap: u64,
+    blockers: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> (Vec<Vec<BurnUnit>>, Vec<BurnUnit>) {
+    let mut chains: Vec<Vec<BurnUnit>> = Vec::new();
+    let mut loose: Vec<BurnUnit> = Vec::new();
+
+    for entry in entries.iter().filter(|e| e.included) {
+        if entry.readiness != DownloadReadiness::Ready {
+            warnings.push(format!(
+                "{}: planned from GOG sizes — burn waits until download is complete ({})",
+                entry.title,
+                entry.readiness.label()
+            ));
+        }
+
+        let policy = entry.effective_split(global_split);
+        match resolve_game(entry, policy, split_cap) {
+            Ok(units) if units.len() == 1 && !units[0].is_split() => {
+                loose.push(units.into_iter().next().unwrap());
+            }
+            Ok(units) => chains.push(units),
+            Err(msg) => blockers.push(msg),
+        }
+    }
+
+    (chains, loose)
+}
+
 fn place_on_fixed(
     capacities: &[u64],
     bins: &mut [Vec<BurnUnit>],
@@ -180,9 +211,9 @@ fn resolve_game(
     policy: SplitPolicy,
     capacity: u64,
 ) -> Result<Vec<BurnUnit>, String> {
-    let files = list_game_files(&entry.folder).map_err(|e| format!("{}: {e}", entry.title))?;
+    let files = game_files_for_planning(entry)?;
     if files.is_empty() {
-        return Err(format!("{}: no files in folder", entry.title));
+        return Err(format!("{}: no files to plan", entry.title));
     }
 
     let total: u64 = files.iter().map(|f| f.size_bytes).sum();
@@ -233,6 +264,98 @@ fn resolve_game(
 
     let units = chunk_ordered_files(entry, &ordered, capacity)?;
     Ok(units)
+}
+
+/// Prefer on-disk files when Ready; otherwise use the GOG/planned manifest.
+fn game_files_for_planning(entry: &BurnListEntry) -> Result<Vec<BurnFile>, String> {
+    if entry.readiness == DownloadReadiness::Ready && entry.folder.is_dir() {
+        match list_game_files(&entry.folder) {
+            Ok(files) if !files.is_empty() => return Ok(files),
+            Ok(_) if !entry.planned_files.is_empty() => {
+                return Ok(burn_files_from_planned(&entry.folder, &entry.planned_files));
+            }
+            Ok(_) => return Err(format!("{}: no files in folder", entry.title)),
+            Err(_) if !entry.planned_files.is_empty() => {
+                return Ok(burn_files_from_planned(&entry.folder, &entry.planned_files));
+            }
+            Err(e) => return Err(format!("{}: {e}", entry.title)),
+        }
+    }
+
+    if !entry.planned_files.is_empty() {
+        return Ok(burn_files_from_planned(&entry.folder, &entry.planned_files));
+    }
+
+    Err(format!(
+        "{}: no size data — plan from Library or download first",
+        entry.title
+    ))
+}
+
+pub fn burn_files_from_planned(folder: &Path, planned: &[PlannedFile]) -> Vec<BurnFile> {
+    planned
+        .iter()
+        .map(|f| BurnFile {
+            path: folder.join(&f.relative_name),
+            relative_name: f.relative_name.clone(),
+            size_bytes: f.size_bytes,
+        })
+        .collect()
+}
+
+/// Fill in on-disk paths for planned/split units before burning.
+pub fn resolve_disc_file_paths(
+    disc: &mut DiscLayout,
+    folders: &[(u64, PathBuf)],
+) -> Result<(), String> {
+    for unit in &mut disc.units {
+        let folder = folders
+            .iter()
+            .find(|(id, _)| *id == unit.game_id)
+            .map(|(_, p)| p.clone())
+            .or_else(|| {
+                let sanitized = sanitize_filename::sanitize(&unit.game_title);
+                folders.iter().find_map(|(_, p)| {
+                    let name = p.file_name()?.to_string_lossy();
+                    if name == sanitized || name.eq_ignore_ascii_case(&unit.game_title) {
+                        Some(p.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| format!("missing folder for '{}'", unit.game_title))?;
+
+        let is_split = unit.is_split();
+        let game_title = unit.game_title.clone();
+        for file in &mut unit.files {
+            let path = if file.relative_name.is_empty() {
+                folder.clone()
+            } else {
+                folder.join(&file.relative_name)
+            };
+            if is_split && !path.is_file() {
+                return Err(format!(
+                    "missing file for '{game_title}': {}",
+                    path.display()
+                ));
+            }
+            file.path = path;
+        }
+    }
+    Ok(())
+}
+
+pub fn planned_files_from_download_files(
+    files: &[crate::gog::DownloadFile],
+) -> Vec<PlannedFile> {
+    files
+        .iter()
+        .map(|f| PlannedFile {
+            relative_name: f.name.clone(),
+            size_bytes: f.size,
+        })
+        .collect()
 }
 
 fn entry_media_hint(capacity: u64) -> String {
@@ -641,7 +764,115 @@ mod tests {
             readiness: DownloadReadiness::Ready,
             split_override: Some(policy),
             included: true,
+            planned_files: Vec::new(),
         }
+    }
+
+    fn entry_planned(
+        id: u64,
+        title: &str,
+        files: Vec<PlannedFile>,
+        policy: SplitPolicy,
+    ) -> BurnListEntry {
+        let size: u64 = files.iter().map(|f| f.size_bytes).sum();
+        BurnListEntry {
+            game_id: id,
+            title: title.into(),
+            folder: PathBuf::from("/tmp/not-downloaded"),
+            size_bytes: size,
+            readiness: DownloadReadiness::Pending,
+            split_override: Some(policy),
+            included: true,
+            planned_files: files,
+        }
+    }
+
+    #[test]
+    fn plan_from_planned_files_without_download() {
+        let entries = vec![entry_planned(
+            1,
+            "SmallGame",
+            vec![PlannedFile {
+                relative_name: "setup.exe".into(),
+                size_bytes: 1_000,
+            }],
+            SplitPolicy::Never,
+        )];
+        let plan = plan_homogeneous_discs(
+            DiscMedia::Dvd5,
+            &entries,
+            SplitPolicy::Never,
+            BurnOptions::default(),
+        );
+        assert!(plan.blockers.is_empty());
+        assert_eq!(plan.discs.len(), 1);
+        assert_eq!(plan.discs[0].units.len(), 1);
+        assert_eq!(plan.discs[0].used_bytes, 1_000);
+    }
+
+    #[test]
+    fn homogeneous_counts_discs_from_sizes() {
+        let capacity = DiscMedia::Dvd5.capacity_bytes();
+        let entries = vec![
+            entry_planned(
+                1,
+                "A",
+                vec![PlannedFile {
+                    relative_name: "a.bin".into(),
+                    size_bytes: capacity * 3 / 4,
+                }],
+                SplitPolicy::Never,
+            ),
+            entry_planned(
+                2,
+                "B",
+                vec![PlannedFile {
+                    relative_name: "b.bin".into(),
+                    size_bytes: capacity * 3 / 4,
+                }],
+                SplitPolicy::Never,
+            ),
+        ];
+        let plan = plan_homogeneous_discs(
+            DiscMedia::Dvd5,
+            &entries,
+            SplitPolicy::Never,
+            BurnOptions::default(),
+        );
+        assert_eq!(plan.discs.len(), 2);
+    }
+
+    #[test]
+    fn split_from_planned_gog_bins() {
+        let e = entry_planned(
+            9,
+            "HugeGame",
+            vec![
+                PlannedFile {
+                    relative_name: "setup_huge.exe".into(),
+                    size_bytes: 500,
+                },
+                PlannedFile {
+                    relative_name: "setup_huge-1.bin".into(),
+                    size_bytes: 900,
+                },
+                PlannedFile {
+                    relative_name: "setup_huge-2.bin".into(),
+                    size_bytes: 900,
+                },
+                PlannedFile {
+                    relative_name: "setup_huge-3.bin".into(),
+                    size_bytes: 900,
+                },
+            ],
+            SplitPolicy::WhenOversized,
+        );
+        let units = resolve_game(&e, SplitPolicy::WhenOversized, 2000).unwrap();
+        assert!(units.len() >= 2);
+        assert!(units[0]
+            .files
+            .iter()
+            .any(|f| f.relative_name.ends_with(".exe")));
     }
 
     #[test]

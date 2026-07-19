@@ -55,7 +55,7 @@ impl QueuePanel {
                     };
                     ui.add(ProgressBar::new(fraction).text(text));
                     if matches!(item.status, JobStatus::Queued | JobStatus::Running)
-                        && ui.small_button("Cancel").clicked()
+                        && ui.button("Cancel").clicked()
                     {
                         on_cancel(item.id);
                     }

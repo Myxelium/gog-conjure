@@ -76,12 +76,12 @@ impl GameDetailPanel {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Installers / versions").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("All installers").clicked() {
+                        if ui.button("All installers").clicked() {
                             for file in &details.installers {
                                 selected.insert(file.id.clone());
                             }
                         }
-                        if ui.small_button("None").clicked() {
+                        if ui.button("None").clicked() {
                             for file in &details.installers {
                                 selected.remove(&file.id);
                             }
@@ -98,7 +98,7 @@ impl GameDetailPanel {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Extras (optional)").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("All extras").clicked() {
+                        if ui.button("All extras").clicked() {
                             for file in &details.extras {
                                 selected.insert(file.id.clone());
                             }

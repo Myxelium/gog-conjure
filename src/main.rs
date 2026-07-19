@@ -45,11 +45,15 @@ fn main() -> ExitCode {
 }
 
 fn run_app() -> eframe::Result<()> {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("app icon PNG must be valid");
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("gog-conjure"),
+            .with_title("gog-conjure")
+            .with_icon(icon),
         ..Default::default()
     };
 

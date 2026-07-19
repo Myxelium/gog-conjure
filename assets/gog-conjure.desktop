@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=gog-conjure
+Comment=GOG library downloader and disc burner
+Exec=gog-conjure
+Icon=gog-conjure
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=GOG;download;burn;

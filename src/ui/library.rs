@@ -13,8 +13,8 @@ pub struct LibraryPanel;
 pub struct LibraryActions {
     pub select_all_filtered: bool,
     pub clear_checks: bool,
-    pub queue_checked: bool,
-    pub download_and_burn: bool,
+    pub download_selected: bool,
+    pub plan_selected: bool,
 }
 
 impl LibraryPanel {
@@ -30,8 +30,8 @@ impl LibraryPanel {
         let mut actions = LibraryActions {
             select_all_filtered: false,
             clear_checks: false,
-            queue_checked: false,
-            download_and_burn: false,
+            download_selected: false,
+            plan_selected: false,
         };
 
         ui.heading("Library");
@@ -56,28 +56,33 @@ impl LibraryPanel {
         });
 
         ui.horizontal_wrapped(|ui| {
-            if ui.small_button("Select visible").clicked() {
+            if ui.button("Select visible").clicked() {
                 actions.select_all_filtered = true;
             }
-            if ui.small_button("Clear checks").clicked() {
+            if ui.button("Clear checks").clicked() {
                 actions.clear_checks = true;
             }
-            let can_queue = !checked.is_empty();
+            let can_act = !checked.is_empty();
+            let download_label = if checked.len() > 1 {
+                "Download selected"
+            } else {
+                "Download"
+            };
             if ui
-                .add_enabled(can_queue, egui::Button::new("Queue selected"))
+                .add_enabled(can_act, egui::Button::new(download_label))
                 .on_hover_text("Download all files for every checked game")
                 .clicked()
             {
-                actions.queue_checked = true;
+                actions.download_selected = true;
             }
             if ui
-                .add_enabled(can_queue, egui::Button::new("Download & add to burn"))
+                .add_enabled(can_act, egui::Button::new("Plan"))
                 .on_hover_text(
-                    "Download all files for checked games and add them to the Burn list",
+                    "Estimate how many discs are needed from GOG file sizes, then add to Burn",
                 )
                 .clicked()
             {
-                actions.download_and_burn = true;
+                actions.plan_selected = true;
             }
         });
         ui.separator();

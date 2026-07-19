@@ -53,6 +53,13 @@ impl DownloadReadiness {
     }
 }
 
+/// File size/name known from GOG (or prior queue) before the download finishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    pub relative_name: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BurnListEntry {
     pub game_id: u64,
@@ -63,11 +70,17 @@ pub struct BurnListEntry {
     pub split_override: Option<SplitPolicy>,
     /// Include when planning into discs.
     pub included: bool,
+    /// Expected files for size-first planning (GOG API / queue selection).
+    pub planned_files: Vec<PlannedFile>,
 }
 
 impl BurnListEntry {
     pub fn effective_split(&self, global: SplitPolicy) -> SplitPolicy {
         self.split_override.unwrap_or(global)
+    }
+
+    pub fn planned_size(&self) -> u64 {
+        self.planned_files.iter().map(|f| f.size_bytes).sum()
     }
 }
 

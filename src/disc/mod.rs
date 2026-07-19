@@ -23,5 +23,8 @@ pub use models::{
     BurnListEntry, BurnOptions, BurnPlan, DiscBurnStatus, DiscLayout, DownloadReadiness,
     OpticalDrive, SplitPolicy,
 };
-pub use pack::{folder_size, list_available_downloads, plan_into_discs};
+pub use pack::{
+    folder_size, list_available_downloads, plan_homogeneous_discs, plan_into_discs,
+    planned_files_from_download_files, resolve_disc_file_paths,
+};
 pub use volid::{sanitize_volid, VOLID_MAX_LEN};

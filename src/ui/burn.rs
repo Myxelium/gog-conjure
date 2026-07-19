@@ -5,6 +5,7 @@ use crate::disc::{
     DiscMedia, DownloadReadiness, OpticalDrive, SplitPolicy, VOLID_MAX_LEN,
 };
 use crate::gog::format_bytes;
+use crate::theme::{PRIMARY_BTN, SIDE_BTN};
 
 pub struct BurnPanel;
 
@@ -16,8 +17,11 @@ pub struct BurnPanelActions {
     pub add_disc: bool,
     pub remove_disc: Option<usize>,
     pub burn_disc: Option<usize>,
+    pub download_disc: Option<usize>,
     pub remove_from_list: Option<u64>,
     pub add_available: Option<usize>,
+    /// Indices into `available` for bulk add (respects current filter).
+    pub add_all_available: Vec<usize>,
     pub install_xorriso: bool,
     pub new_disc_media: DiscMedia,
 }
@@ -53,8 +57,10 @@ impl BurnPanel {
             add_disc: false,
             remove_disc: None,
             burn_disc: None,
+            download_disc: None,
             remove_from_list: None,
             add_available: None,
+            add_all_available: Vec::new(),
             install_xorriso: false,
             new_disc_media: *new_disc_media,
         };
@@ -153,6 +159,7 @@ impl BurnPanel {
                         });
                     } else {
                         let mut burn_clicked = None;
+                        let mut download_disc = None;
                         let mut remove_disc = None;
                         ScrollArea::vertical()
                             .id_salt("burn_discs_scroll")
@@ -164,6 +171,22 @@ impl BurnPanel {
                                         .show(ui, |ui| {
                                             let is_active = burning
                                                 && burn_active_disc == Some(disc.index);
+                                            let downloads_ready = disc.units.iter().all(|u| {
+                                                burn_list
+                                                    .iter()
+                                                    .find(|e| {
+                                                        e.game_id == u.game_id
+                                                            || e.title == u.game_title
+                                                    })
+                                                    .map(|e| {
+                                                        e.readiness == DownloadReadiness::Ready
+                                                    })
+                                                    .unwrap_or(true)
+                                            });
+                                            let need_download_count = disc_games_needing_download(
+                                                disc, burn_list,
+                                            )
+                                            .len();
                                             show_disc_card(
                                                 ui,
                                                 disc,
@@ -175,7 +198,10 @@ impl BurnPanel {
                                                 burn_progress,
                                                 burn_progress_text,
                                                 plan.blockers.is_empty(),
+                                                downloads_ready,
+                                                need_download_count,
                                                 &mut burn_clicked,
+                                                &mut download_disc,
                                                 &mut remove_disc,
                                                 &mut actions.refresh_drives,
                                             );
@@ -185,6 +211,7 @@ impl BurnPanel {
                                 }
                             });
                         actions.burn_disc = burn_clicked;
+                        actions.download_disc = download_disc;
                         actions.remove_disc = remove_disc;
                     }
 
@@ -231,8 +258,6 @@ impl BurnPanel {
     }
 }
 
-const SIDE_BTN: egui::Vec2 = egui::vec2(72.0, 24.0);
-
 fn show_available(
     ui: &mut Ui,
     available: &[AvailableDownload],
@@ -240,15 +265,37 @@ fn show_available(
     actions: &mut BurnPanelActions,
     burning: bool,
 ) {
+    let filter_l = filter.to_lowercase();
+    let filtered: Vec<(usize, &AvailableDownload)> = available
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| filter_l.is_empty() || a.title.to_lowercase().contains(&filter_l))
+        .collect();
+    let addable: Vec<usize> = filtered
+        .iter()
+        .filter(|(_, a)| !a.on_burn_list)
+        .map(|(idx, _)| *idx)
+        .collect();
+
     ui.horizontal(|ui| {
         ui.label(RichText::new("Downloaded").strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .add_sized(SIDE_BTN, egui::Button::new("Refresh"))
+                .add(egui::Button::new("Refresh").min_size(SIDE_BTN))
                 .on_hover_text("Rescan download folder")
                 .clicked()
             {
                 actions.refresh_available = true;
+            }
+            if ui
+                .add_enabled(
+                    !burning && !addable.is_empty(),
+                    egui::Button::new("Add all").min_size(SIDE_BTN),
+                )
+                .on_hover_text("Add all visible downloads that are not already on the burn list")
+                .clicked()
+            {
+                actions.add_all_available = addable.clone();
             }
         });
     });
@@ -258,13 +305,6 @@ fn show_available(
             .desired_width(f32::INFINITY),
     );
     ui.add_space(4.0);
-
-    let filter_l = filter.to_lowercase();
-    let filtered: Vec<(usize, &AvailableDownload)> = available
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| filter_l.is_empty() || a.title.to_lowercase().contains(&filter_l))
-        .collect();
 
     if filtered.is_empty() {
         ui.weak("No downloaded games found yet.");
@@ -342,7 +382,7 @@ fn show_burn_queue(
 
     if burn_list.is_empty() {
         ui.weak(
-            "Add downloads from the list above, or use “Download & add to burn” in the Library.",
+            "Add downloads from the list above, or use Plan / Download in the Library.",
         );
         return;
     }
@@ -438,7 +478,9 @@ fn show_discs_header(
         let can_plan = !plan.discs.is_empty() && burn_list.iter().any(|e| e.included);
         if ui
             .add_enabled(can_plan && !burning, egui::Button::new("Plan"))
-            .on_hover_text("Organize the burn list onto your discs as efficiently as possible")
+            .on_hover_text(
+                "Organize the burn list onto your discs using GOG/file sizes (downloads need not be finished yet)",
+            )
             .clicked()
         {
             actions.plan = true;
@@ -458,6 +500,43 @@ fn show_discs_header(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Games on a disc that are neither Ready nor currently Downloading.
+fn disc_games_needing_download<'a>(
+    disc: &DiscLayout,
+    burn_list: &'a [BurnListEntry],
+) -> Vec<&'a BurnListEntry> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_titles = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for unit in &disc.units {
+        let entry = burn_list.iter().find(|e| {
+            (unit.game_id != 0 && e.game_id == unit.game_id) || e.title == unit.game_title
+        });
+        let Some(entry) = entry else {
+            continue;
+        };
+        if !needs_download(entry) {
+            continue;
+        }
+        let dup = if entry.game_id != 0 {
+            !seen_ids.insert(entry.game_id)
+        } else {
+            !seen_titles.insert(entry.title.as_str())
+        };
+        if !dup {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+fn needs_download(entry: &BurnListEntry) -> bool {
+    !matches!(
+        entry.readiness,
+        DownloadReadiness::Ready | DownloadReadiness::Downloading
+    )
+}
+
 fn show_disc_card(
     ui: &mut Ui,
     disc: &mut DiscLayout,
@@ -469,7 +548,10 @@ fn show_disc_card(
     burn_progress: Option<f32>,
     burn_progress_text: &str,
     plan_ok: bool,
+    downloads_ready: bool,
+    need_download_count: usize,
     burn_clicked: &mut Option<usize>,
+    download_clicked: &mut Option<usize>,
     remove_disc: &mut Option<usize>,
     refresh_drives: &mut bool,
 ) {
@@ -496,7 +578,7 @@ fn show_disc_card(
         ui.weak(disc.status.label());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .add_enabled(!burning, egui::Button::new("Remove"))
+                .add_enabled(!burning, egui::Button::new("Remove").min_size(SIDE_BTN))
                 .clicked()
             {
                 *remove_disc = Some(disc.index);
@@ -545,7 +627,11 @@ fn show_disc_card(
                     ui.selectable_value(&mut disc.options.drive, d.path.clone(), d.label());
                 }
             });
-        if ui.small_button("↻").on_hover_text("Refresh drives").clicked() {
+        if ui
+            .add(egui::Button::new("↻").min_size(egui::vec2(SIDE_BTN.y, SIDE_BTN.y)))
+            .on_hover_text("Refresh drives")
+            .clicked()
+        {
             *refresh_drives = true;
         }
 
@@ -615,6 +701,7 @@ fn show_disc_card(
 
     let can_burn = backend_ok
         && plan_ok
+        && downloads_ready
         && !disc.units.is_empty()
         && !disc.options.drive.is_empty()
         && !burning
@@ -631,6 +718,8 @@ fn show_disc_card(
         "Resolve blockers first"
     } else if disc.units.is_empty() {
         "Plan games onto this disc first"
+    } else if !downloads_ready {
+        "Wait for required downloads to finish before burning"
     } else if disc.options.drive.is_empty() {
         "Select a drive for this disc"
     } else if burning {
@@ -640,11 +729,35 @@ fn show_disc_card(
     };
 
     ui.add_space(4.0);
-    if ui
-        .add_enabled(can_burn, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(100.0, 28.0)))
-        .on_hover_text(tip)
-        .clicked()
-    {
-        *burn_clicked = Some(disc.index);
-    }
+    ui.horizontal(|ui| {
+        if need_download_count > 0 {
+            let dl_label = if need_download_count == 1 {
+                "Download".to_string()
+            } else {
+                format!("Download ({need_download_count})")
+            };
+            if ui
+                .add_enabled(
+                    !burning,
+                    egui::Button::new(dl_label).min_size(PRIMARY_BTN),
+                )
+                .on_hover_text(
+                    "Queue downloads for games on this disc that are not downloaded or already downloading",
+                )
+                .clicked()
+            {
+                *download_clicked = Some(disc.index);
+            }
+        }
+        if ui
+            .add_enabled(
+                can_burn,
+                egui::Button::new(RichText::new(label).strong()).min_size(PRIMARY_BTN),
+            )
+            .on_hover_text(tip)
+            .clicked()
+        {
+            *burn_clicked = Some(disc.index);
+        }
+    });
 }

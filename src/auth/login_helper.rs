@@ -26,9 +26,13 @@ pub fn run_login_window(output_path: &Path) -> Result<()> {
     let _ = std::fs::remove_file(output_path);
 
     let mut event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
+    let mut window_builder = WindowBuilder::new()
         .with_title("GOG Login — gog-conjure")
-        .with_inner_size(tao::dpi::LogicalSize::new(980.0, 720.0))
+        .with_inner_size(tao::dpi::LogicalSize::new(980.0, 720.0));
+    if let Some(icon) = load_window_icon() {
+        window_builder = window_builder.with_window_icon(Some(icon));
+    }
+    let window = window_builder
         .build(&event_loop)
         .context("create login window")?;
 
@@ -121,4 +125,12 @@ fn try_capture(tx: &mpsc::Sender<String>, url: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn load_window_icon() -> Option<tao::window::Icon> {
+    let image = image::load_from_memory(include_bytes!("../../assets/icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    tao::window::Icon::from_rgba(image.into_raw(), width, height).ok()
 }
