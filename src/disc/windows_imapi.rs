@@ -238,13 +238,16 @@ fn check_cancel(cancel: &Arc<AtomicBool>) -> Result<(), String> {
 }
 
 fn with_com<T>(f: impl FnOnce() -> Result<T, BurnError>) -> Result<T, BurnError> {
-    unsafe {
-        // Already-initialized COM on this thread is fine.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    // S_OK / S_FALSE both mean we must pair with CoUninitialize.
+    // RPC_E_CHANGED_MODE means this thread already has a different apartment (typical after
+    // an STA file dialog on the UI thread) — COM is usable, but CoUninitialize must not run
+    // or it tears down someone else's apartment and can hard-crash the process.
+    let should_uninit = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     let result = f();
-    unsafe {
-        CoUninitialize();
+    if should_uninit {
+        unsafe {
+            CoUninitialize();
+        }
     }
     result
 }
