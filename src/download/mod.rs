@@ -4,6 +4,7 @@ pub use path::game_folder;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
@@ -17,7 +18,6 @@ use crate::gog::{DownloadFile, GogClient};
 #[derive(Debug, Clone)]
 pub struct QueueItem {
     pub id: u64,
-    #[allow(dead_code)]
     pub game_id: u64,
     pub game_title: String,
     pub file: DownloadFile,
@@ -266,6 +266,14 @@ impl DownloadQueue {
 
         let mut stream = resp.bytes_stream();
         let mut downloaded = resume_from;
+        // Throttle UI events — per-chunk clones on an unbounded channel could
+        // balloon RAM while downloading multi‑GB installers.
+        let mut last_report = Instant::now();
+        let mut last_reported = resume_from;
+        let mut since_flush = 0u64;
+        const REPORT_EVERY: Duration = Duration::from_millis(250);
+        const REPORT_BYTES: u64 = 4 * 1024 * 1024;
+        const FLUSH_BYTES: u64 = 8 * 1024 * 1024;
 
         while let Some(chunk) = stream.next().await {
             {
@@ -278,17 +286,37 @@ impl DownloadQueue {
             }
             let chunk = chunk?;
             file_out.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            {
+            let n = chunk.len() as u64;
+            downloaded += n;
+            since_flush += n;
+
+            if since_flush >= FLUSH_BYTES {
+                file_out.flush().await?;
+                since_flush = 0;
+            }
+
+            let should_report = last_report.elapsed() >= REPORT_EVERY
+                || downloaded.saturating_sub(last_reported) >= REPORT_BYTES;
+            if should_report {
                 let mut inner = self.inner.lock();
                 if let Some(item) = inner.items.iter_mut().find(|i| i.id == id) {
                     item.downloaded = downloaded;
                     item.total = total.max(downloaded);
                     let _ = self.events.send(QueueEvent::Updated(item.clone()));
                 }
+                last_report = Instant::now();
+                last_reported = downloaded;
             }
         }
         file_out.flush().await?;
+        {
+            let mut inner = self.inner.lock();
+            if let Some(item) = inner.items.iter_mut().find(|i| i.id == id) {
+                item.downloaded = downloaded;
+                item.total = total.max(downloaded);
+                let _ = self.events.send(QueueEvent::Updated(item.clone()));
+            }
+        }
         Ok(())
     }
 }

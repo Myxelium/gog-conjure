@@ -2,15 +2,23 @@ mod models;
 
 pub use models::*;
 
-use anyhow::{Context, Result};
-use reqwest::Client;
+use anyhow::{bail, Context, Result};
+use reqwest::header::{CONTENT_LENGTH, LOCATION};
+use reqwest::redirect::Policy;
+use reqwest::{Client, StatusCode};
 use serde_json::Value;
+use url::Url;
 
 use crate::auth::AuthState;
+
+/// Refuse to buffer more than this when resolving a downlink JSON/metadata response.
+const MAX_DOWNLINK_BODY: u64 = 1_048_576; // 1 MiB
 
 #[derive(Clone)]
 pub struct GogClient {
     http: Client,
+    /// Never follows redirects — prevents pulling multi‑GB CDN bodies into RAM.
+    http_no_redirect: Client,
     auth: AuthState,
 }
 
@@ -20,7 +28,16 @@ impl GogClient {
             .user_agent("gog-conjure/0.1")
             .build()
             .expect("http client");
-        Self { http, auth }
+        let http_no_redirect = Client::builder()
+            .user_agent("gog-conjure/0.1")
+            .redirect(Policy::none())
+            .build()
+            .expect("http client (no redirect)");
+        Self {
+            http,
+            http_no_redirect,
+            auth,
+        }
     }
 
     pub fn http(&self) -> &Client {
@@ -78,12 +95,15 @@ impl GogClient {
     }
 
     /// Resolve a GOG `downlink` endpoint into a direct CDN URL.
+    ///
+    /// Critical: must not follow redirects into the CDN and must not buffer the
+    /// installer body — that previously loaded entire multi‑GB files into RAM.
     pub async fn resolve_downlink(&self, downlink: &str) -> Result<String> {
         let token = self.auth.access_token(&self.http).await?;
+        let request_url = Url::parse(downlink).context("invalid downlink URL")?;
 
-        // Prefer JSON body from embed.gog.com; do not follow straight to a binary CDN body.
         let resp = self
-            .http
+            .http_no_redirect
             .get(downlink)
             .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/json,text/plain,*/*")
@@ -92,29 +112,74 @@ impl GogClient {
             .context("resolve downlink")?;
 
         let status = resp.status();
-        let final_url = resp.url().clone();
-        let bytes = resp.bytes().await?;
 
-        // Typical GOG response: { "downlink": "https://gog-cdn-.../..." }
-        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(url) = v.get("downlink").and_then(|x| x.as_str()) {
-                return Ok(url.to_string());
+        // 3xx → use Location (signed CDN URL) without downloading the file.
+        if status.is_redirection() {
+            if let Some(loc) = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()) {
+                let resolved = request_url
+                    .join(loc)
+                    .with_context(|| format!("join redirect Location '{loc}'"))?;
+                return Ok(resolved.to_string());
             }
-            if let Some(url) = v.get("url").and_then(|x| x.as_str()) {
-                return Ok(url.to_string());
+            bail!("downlink returned {status} without Location header");
+        }
+
+        if status == StatusCode::OK {
+            let len = resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            if let Some(len) = len {
+                if len > MAX_DOWNLINK_BODY {
+                    bail!(
+                        "downlink response is {len} bytes — refusing to buffer in memory \
+                         (expected a small JSON redirect payload)"
+                    );
+                }
             }
+
+            let bytes = read_body_limited(resp, MAX_DOWNLINK_BODY).await?;
+
+            // Typical GOG response: { "downlink": "https://gog-cdn-.../..." }
+            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(url) = v.get("downlink").and_then(|x| x.as_str()) {
+                    return Ok(url.to_string());
+                }
+                if let Some(url) = v.get("url").and_then(|x| x.as_str()) {
+                    return Ok(url.to_string());
+                }
+            }
+
+            // Plain-text URL body
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                let trimmed = text.trim();
+                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    return Ok(trimmed.to_string());
+                }
+            }
+
+            bail!("could not parse downlink JSON for a CDN URL");
         }
 
-        // Fallback: redirect already landed on a signed CDN URL.
-        let final_s = final_url.as_str();
-        if final_s.contains("gog-cdn") || final_s.contains("cdn.gog.com") {
-            return Ok(final_s.to_string());
-        }
-
-        if status.is_success() {
-            return Ok(final_s.to_string());
-        }
-
-        anyhow::bail!("could not resolve downlink ({status})")
+        bail!("could not resolve downlink ({status})")
     }
+}
+
+async fn read_body_limited(resp: reqwest::Response, max: u64) -> Result<bytes::Bytes> {
+    use futures_util::StreamExt;
+
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read downlink body")?;
+        if (out.len() as u64) + (chunk.len() as u64) > max {
+            bail!(
+                "downlink response exceeded {max} bytes — refusing to buffer in memory"
+            );
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(out))
 }
