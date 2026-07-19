@@ -79,8 +79,11 @@ git push origin v0.1.0
 
 Workflows:
 
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) — Linux / Windows / macOS binaries on GitHub
-- [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml) — Linux binary on Gitea (shell-only; Act image has no Node.js)
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) — GitHub assets:
+  - Linux `x86_64` / `aarch64`: raw binary, `.deb`, AppImage
+  - Windows `x86_64` / `aarch64`: `.exe`
+  - macOS `aarch64` / `x86_64`: raw binary
+- [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml) — Gitea Linux assets for the runner arch (binary + `.deb` + AppImage; shell-only Act workflow)
 
 ## License
 
