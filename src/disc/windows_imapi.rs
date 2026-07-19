@@ -41,6 +41,17 @@ const STREAM_CHUNK: usize = 1024 * 1024; // 1 MiB — keeps peak RAM bounded
 const VARIANT_FALSE: VARIANT_BOOL = VARIANT_BOOL(0);
 const VARIANT_TRUE: VARIANT_BOOL = VARIANT_BOOL(-1);
 
+/// `windows` 0.61 COM interfaces are `!Send`; IMAPI write cancellation is safe across
+/// threads for a single writer, so mark this wrapper explicitly.
+struct SendDiscFormat2Data(IDiscFormat2Data);
+// SAFETY: CancelWrite is documented as callable while Write runs on another thread.
+unsafe impl Send for SendDiscFormat2Data {}
+impl SendDiscFormat2Data {
+    unsafe fn cancel_write(&self) {
+        let _ = self.0.CancelWrite();
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WindowsBurner;
 
@@ -486,11 +497,11 @@ unsafe fn burn_iso_file(
     let cancel_flag = cancel.clone();
     let writing = Arc::new(AtomicBool::new(true));
     let writing_watch = writing.clone();
-    let data_cancel = data.clone();
+    let data_cancel = SendDiscFormat2Data(data.clone());
     let watch = std::thread::spawn(move || {
         while writing_watch.load(Ordering::Relaxed) {
             if cancel_flag.load(Ordering::Relaxed) {
-                let _ = unsafe { data_cancel.CancelWrite() };
+                unsafe { data_cancel.cancel_write() };
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
