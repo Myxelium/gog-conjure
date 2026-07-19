@@ -8,15 +8,30 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Gitea Act runners often use a plain Ubuntu image with no Node.js.
+# Avoid JS actions (actions/checkout, dtolnay/rust-toolchain, …) entirely.
 jobs:
   build:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+          if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+            $SUDO apt-get update
+            $SUDO apt-get install -y git ca-certificates curl
+          fi
+          if [ ! -f Cargo.toml ]; then
+            git init
+            git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+            git fetch --depth 1 origin "${GITHUB_SHA}"
+            git checkout --force FETCH_HEAD
+          fi
+          test -f Cargo.toml
+          git log -1 --oneline || true
 
-      # Prefer a plain rustup install: Act runners often struggle with
-      # composite JS actions like dtolnay/rust-toolchain.
       - name: Install Rust
         run: |
           set -euo pipefail
@@ -46,5 +61,16 @@ jobs:
               libxkbcommon-dev libssl-dev
           fi
 
-      - run: cargo build --locked
-      - run: cargo test --locked
+      - name: Build
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . "$HOME/.cargo/env"
+          cargo build --locked
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . "$HOME/.cargo/env"
+          cargo test --locked

@@ -14,12 +14,39 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Linux-only on Gitea Act (no Node.js / no Win/mac runners).
+# Multi-platform binaries are published by the GitHub Release workflow.
 jobs:
-  build-linux:
-    name: Build Linux
+  release-linux:
+    name: Build & publish Linux release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+          if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+            $SUDO apt-get update
+            $SUDO apt-get install -y git ca-certificates curl
+          fi
+          if [ ! -f Cargo.toml ]; then
+            git init
+            git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+            git fetch --depth 1 origin "${GITHUB_SHA}"
+            git checkout --force FETCH_HEAD
+          fi
+          test -f Cargo.toml
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust
         run: |
           set -euo pipefail
@@ -30,6 +57,7 @@ jobs:
           # shellcheck disable=SC1091
           . "$HOME/.cargo/env"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Install system dependencies
         run: |
           set -euo pipefail
@@ -44,77 +72,54 @@ jobs:
               libgtk-3-dev libwebkit2gtk-4.0-dev \
               libxkbcommon-dev libssl-dev
           fi
-      - run: cargo build --release --locked
-      - run: |
+
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
           mkdir -p dist
           cp target/release/gog-conjure dist/gog-conjure-linux-x86_64
           chmod +x dist/gog-conjure-linux-x86_64
-      - uses: actions/upload-artifact@v3
-        with:
-          name: gog-conjure-linux-x86_64
-          path: dist/gog-conjure-linux-x86_64
 
-  build-windows:
-    name: Build Windows
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
-      - run: |
-          mkdir dist
-          copy target\release\gog-conjure.exe dist\gog-conjure-windows-x86_64.exe
-        shell: cmd
-      - uses: actions/upload-artifact@v3
-        with:
-          name: gog-conjure-windows-x86_64.exe
-          path: dist/gog-conjure-windows-x86_64.exe
-
-  build-macos:
-    name: Build macOS
-    runs-on: macos-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
-      - run: |
-          mkdir -p dist
-          cp target/release/gog-conjure dist/gog-conjure-macos
-          chmod +x dist/gog-conjure-macos
-      - uses: actions/upload-artifact@v3
-        with:
-          name: gog-conjure-macos
-          path: dist/gog-conjure-macos
-
-  release:
-    name: Publish Gitea release
-    needs: [build-linux, build-windows, build-macos]
-    if: ${{ always() && needs.build-linux.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v3
-        with:
-          path: release-assets
-      - run: |
-          mkdir -p upload
-          find release-assets -type f -exec cp {} upload/ \;
-          ls -la upload
-          test -n "$(find upload -type f | head -n 1)"
-      - id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: gog-conjure ${{ steps.tag.outputs.name }}
-          draft: false
-          files: upload/*
+      - name: Publish Gitea release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          AUTH="Authorization: token ${GITHUB_TOKEN}"
+          ASSET=dist/gog-conjure-linux-x86_64
+
+          # Create release (ok if it already exists for this tag).
+          curl -sS -X POST \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"gog-conjure ${TAG}\",\"draft\":false}" \
+            "${API}/releases" >/tmp/create-release.json || true
+
+          RELEASE_JSON=$(curl -sS -H "$AUTH" "${API}/releases/tags/${TAG}")
+          RELEASE_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$RELEASE_JSON")
+          echo "Release id: ${RELEASE_ID}"
+
+          # Replace previous asset on re-runs.
+          ASSETS_JSON=$(curl -sS -H "$AUTH" "${API}/releases/${RELEASE_ID}/assets")
+          OLD_ID=$(python3 -c '
+import json,sys
+name="gog-conjure-linux-x86_64"
+for a in json.load(sys.stdin):
+    if a.get("name")==name:
+        print(a["id"]); break
+' <<<"$ASSETS_JSON" || true)
+          if [ -n "${OLD_ID:-}" ]; then
+            curl -sS -X DELETE -H "$AUTH" "${API}/releases/assets/${OLD_ID}" >/dev/null || true
+          fi
+
+          curl -sS -f -X POST \
+            -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"${ASSET}" \
+            "${API}/releases/${RELEASE_ID}/assets?name=gog-conjure-linux-x86_64" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("name"), d.get("browser_download_url","") or d.get("id"))'
+          echo "Published ${TAG} with gog-conjure-linux-x86_64"

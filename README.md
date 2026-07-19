@@ -79,8 +79,8 @@ git push origin v0.1.0
 
 Workflows:
 
-- [`.github/workflows/release.yml`](.github/workflows/release.yml)
-- [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml)
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) — Linux / Windows / macOS binaries on GitHub
+- [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml) — Linux binary on Gitea (shell-only; Act image has no Node.js)
 
 ## License
 
