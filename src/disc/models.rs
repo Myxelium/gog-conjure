@@ -281,6 +281,9 @@ impl OpticalDrive {
             .to_string();
         if name.is_empty() {
             self.path.clone()
+        } else if self.path.len() > 28 {
+            // Unique IMAPI recorder ids are long; prefer the human-readable name.
+            name
         } else {
             format!("{} — {}", self.path, name)
         }

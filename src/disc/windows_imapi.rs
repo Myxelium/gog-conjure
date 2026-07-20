@@ -11,40 +11,59 @@
 //! Overview: <https://learn.microsoft.com/en-us/windows/win32/imapi/using-imapi>
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use windows::core::{BSTR, Interface, PCWSTR};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::Storage::Imapi::{
     IBurnVerification, IDiscFormat2Data, IDiscFormat2Erase, IDiscMaster2, IDiscRecorder2,
     IFileSystemImage, IFsiDirectoryItem, FsiFileSystemISO9660, FsiFileSystemJoliet, FsiFileSystems,
-    IMAPI_BURN_VERIFICATION_FULL, IMAPI_BURN_VERIFICATION_NONE, IMAPI_MEDIA_TYPE_DISK,
+    IMAPI_BURN_VERIFICATION_FULL, IMAPI_BURN_VERIFICATION_NONE, IMAPI_MEDIA_PHYSICAL_TYPE,
+    IMAPI_MEDIA_TYPE_BDR, IMAPI_MEDIA_TYPE_DVDPLUSR, IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER,
     MsftDiscFormat2Data, MsftDiscFormat2Erase, MsftDiscMaster2, MsftDiscRecorder2,
     MsftFileSystemImage,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED, SAFEARRAY, STGM_READ, STGM_SHARE_DENY_WRITE, STREAM_SEEK_SET,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED, STGM_READ, STGM_SHARE_DENY_WRITE, STREAM_SEEK_SET,
 };
-use windows::Win32::System::Ole::{
-    SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayGetVartype,
-};
-use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::Win32::UI::Shell::SHCreateStreamOnFileW;
 
 /// CLI flag for the isolated drive-enumeration helper process.
 pub const LIST_DRIVES_FLAG: &str = "--list-optical-drives";
+/// CLI flag for the isolated IMAPI burn helper process.
+pub const BURN_JOB_FLAG: &str = "--imapi-burn-job";
 
 use super::burner::{BurnError, BurnEvent, DiscBurner};
+use super::media::DiscMedia;
 use super::models::{BurnOptions, DiscLayout, OpticalDrive};
 use super::stage::{simulate_iso_path, stage_disc_layout};
 use super::volid::{sanitize_volid, VOLID_MAX_LEN};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BurnJobFile {
+    stage_root: PathBuf,
+    iso_path: PathBuf,
+    options: BurnOptions,
+    media: DiscMedia,
+    volid: String,
+    disc_index: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum HelperEvent {
+    Progress { fraction: f32, message: String },
+    Log { line: String },
+    Finished { ok: bool, #[serde(default)] error: Option<String> },
+}
 
 const CLIENT_NAME: &str = "gog-conjure";
 const STREAM_CHUNK: usize = 1024 * 1024; // 1 MiB — keeps peak RAM bounded
@@ -165,6 +184,8 @@ fn run_burn_job(
     tx: &mpsc::UnboundedSender<BurnEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
+    // Staging is pure filesystem work — keep it in-process.
+    // All IMAPI COM runs in a child process so an AV cannot kill the UI.
     check_cancel(cancel)?;
     let _ = tx.send(BurnEvent::Progress {
         fraction: 0.05,
@@ -174,6 +195,10 @@ fn run_burn_job(
     let staged = stage_disc_layout(disc, game_folders).map_err(|e| e.to_string())?;
 
     check_cancel(cancel)?;
+    if !options.simulate && options.drive.trim().is_empty() {
+        return Err("No optical drive selected.".into());
+    }
+
     let iso_path = if options.simulate {
         simulate_iso_path(disc.index)
     } else {
@@ -187,49 +212,207 @@ fn run_burn_job(
         let _ = std::fs::remove_file(&iso_path);
     }
 
-    let _ = tx.send(BurnEvent::Progress {
-        fraction: 0.12,
-        message: "Building ISO image…".into(),
-    });
-    let _ = tx.send(BurnEvent::Log(format!(
-        "Building ISO (streamed to disk): {}",
-        iso_path.display()
-    )));
+    let job = BurnJobFile {
+        stage_root: staged.root.clone(),
+        iso_path: iso_path.clone(),
+        options: options.clone(),
+        media: disc.media,
+        volid: disc_volid(disc),
+        disc_index: disc.index,
+    };
+    let job_path = std::env::temp_dir().join(format!(
+        "gog-conjure-burn-job-{}-{}.json",
+        disc.index + 1,
+        std::process::id()
+    ));
+    let job_json = serde_json::to_string_pretty(&job).map_err(|e| e.to_string())?;
+    std::fs::write(&job_path, job_json).map_err(|e| e.to_string())?;
 
-    with_com(|| unsafe {
-        build_iso_file(&staged.root, disc, &iso_path, tx, cancel)?;
-        Ok(())
-    })
-    .map_err(|e| e.to_string())?;
+    let result = run_burn_helper_subprocess(&job_path, tx, cancel);
 
-    // Staging dir can go away once the ISO exists.
+    // Keep staging dir alive until the helper exits (it reads files during ISO build).
     drop(staged);
-
-    if options.simulate {
-        let _ = tx.send(BurnEvent::Progress {
-            fraction: 1.0,
-            message: "Simulate complete".into(),
-        });
-        let _ = tx.send(BurnEvent::Log(format!(
-            "Simulate complete — ISO left at {}",
-            iso_path.display()
-        )));
-        return Ok(());
-    }
-
-    check_cancel(cancel)?;
-    if options.drive.trim().is_empty() {
+    let _ = std::fs::remove_file(&job_path);
+    if !options.simulate {
         let _ = std::fs::remove_file(&iso_path);
-        return Err("No optical drive selected.".into());
+    }
+    result
+}
+
+fn run_burn_helper_subprocess(
+    job_path: &Path,
+    tx: &mpsc::UnboundedSender<BurnEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("resolve executable: {e}"))?;
+    let mut child = Command::new(&exe)
+        .arg(BURN_JOB_FLAG)
+        .arg(job_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn burn helper: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "burn helper missing stdout".to_string())?;
+    let stderr = child.stderr.take();
+    let mut finished_ok: Option<Result<(), String>> = None;
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("burn cancelled".into());
+        }
+        let line = match line {
+            Ok(l) => l,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("read burn helper stdout: {err}"));
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: HelperEvent = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = tx.send(BurnEvent::Log(line.to_string()));
+                continue;
+            }
+        };
+        match event {
+            HelperEvent::Progress { fraction, message } => {
+                let _ = tx.send(BurnEvent::Progress { fraction, message });
+            }
+            HelperEvent::Log { line } => {
+                let _ = tx.send(BurnEvent::Log(line));
+            }
+            HelperEvent::Finished { ok, error } => {
+                finished_ok = Some(if ok {
+                    Ok(())
+                } else {
+                    Err(error.unwrap_or_else(|| "burn helper failed".into()))
+                });
+            }
+        }
     }
 
-    let burn_result = with_com(|| unsafe {
-        burn_iso_file(&iso_path, options, tx, cancel)?;
+    let status = child.wait().map_err(|e| format!("wait burn helper: {e}"))?;
+    if let Some(result) = finished_ok {
+        return result;
+    }
+    if status.success() {
         Ok(())
+    } else {
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "crash/signal".into());
+        let stderr = stderr
+            .map(|s| {
+                let mut buf = String::new();
+                let _ = BufReader::new(s).read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default();
+        Err(format!(
+            "IMAPI burn helper exited unexpectedly ({code}). Optical COM faults are isolated from the UI. {}",
+            stderr.trim()
+        ))
+    }
+}
+
+/// Entry point for `gog-conjure --imapi-burn-job <job.json>`.
+pub fn run_burn_job_helper(job_path: &Path) -> Result<(), String> {
+    let raw = std::fs::read_to_string(job_path).map_err(|e| format!("read burn job: {e}"))?;
+    let job: BurnJobFile =
+        serde_json::from_str(&raw).map_err(|e| format!("parse burn job: {e}"))?;
+
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<BurnEvent>();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Pump helper-local BurnEvents onto stdout while COM work runs on this thread.
+    let pump = std::thread::spawn(move || {
+        while let Ok(ev) = progress_rx.recv() {
+            match ev {
+                BurnEvent::Progress { fraction, message } => {
+                    emit_helper(HelperEvent::Progress { fraction, message });
+                }
+                BurnEvent::Log(line) => emit_helper(HelperEvent::Log { line }),
+                BurnEvent::Finished(result) => {
+                    match result {
+                        Ok(()) => emit_helper(HelperEvent::Finished {
+                            ok: true,
+                            error: None,
+                        }),
+                        Err(error) => emit_helper(HelperEvent::Finished {
+                            ok: false,
+                            error: Some(error),
+                        }),
+                    }
+                    break;
+                }
+            }
+        }
     });
 
-    let _ = std::fs::remove_file(&iso_path);
-    burn_result.map_err(|e| e.to_string())
+    let bridge = HelperProgress(progress_tx.clone());
+    let com_result = with_com(|| {
+        unsafe {
+            build_iso_file(
+                &job.stage_root,
+                job.media,
+                &job.volid,
+                &job.iso_path,
+                &bridge,
+                &cancel,
+            )?;
+        }
+        if job.options.simulate {
+            bridge.send(BurnEvent::Progress {
+                fraction: 1.0,
+                message: "Simulate complete".into(),
+            });
+            bridge.send(BurnEvent::Log(format!(
+                "Simulate complete — ISO left at {}",
+                job.iso_path.display()
+            )));
+            return Ok(());
+        }
+        unsafe { burn_iso_file(&job.iso_path, &job.options, &bridge, &cancel) }
+    });
+
+    match &com_result {
+        Ok(()) => bridge.send(BurnEvent::Finished(Ok(()))),
+        Err(err) => bridge.send(BurnEvent::Finished(Err(err.to_string()))),
+    }
+    drop(progress_tx);
+    drop(bridge);
+    let _ = pump.join();
+
+    com_result.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn emit_helper(event: HelperEvent) {
+    if let Ok(line) = serde_json::to_string(&event) {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Thin adapter so COM helpers can emit progress without depending on tokio.
+struct HelperProgress(std::sync::mpsc::Sender<BurnEvent>);
+impl HelperProgress {
+    fn send(&self, event: BurnEvent) {
+        let _ = self.0.send(event);
+    }
 }
 
 fn disc_volid(disc: &DiscLayout) -> String {
@@ -306,7 +489,10 @@ fn with_com<T>(f: impl FnOnce() -> Result<T, BurnError>) -> Result<T, BurnError>
 
 /// Enumerate recorders like the Microsoft *Checking Drive Support* sample:
 /// `MsftDiscMaster2` → `Item(i)` → `MsftDiscRecorder2.InitializeDiscRecorder` →
-/// read `VendorId` / `ProductId` / `VolumeName` / `VolumePathNames`.
+/// read `ActiveDiscRecorder` / `VendorId` / `ProductId` / `VolumeName`.
+///
+/// Intentionally avoids `VolumePathNames` (SAFEARRAY of VARIANTs) — that property has
+/// hard-crashed this app; the unique recorder id is what burn re-opens with anyway.
 unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
     let master: IDiscMaster2 =
         CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_INPROC_SERVER).map_err(|e| {
@@ -340,95 +526,69 @@ unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
             continue;
         }
 
-        // Canonical recorder id (what Burning a Disc uses to re-open the device).
-        let active_id = recorder
+        // Canonical id from Burning a Disc — used later by open_recorder / SetRecorder.
+        let path = recorder
             .ActiveDiscRecorder()
             .map(bstr_to_string)
             .unwrap_or_else(|_| bstr_to_string(unique_id));
         let vendor = bstr_to_string(recorder.VendorId().unwrap_or_default());
         let product = bstr_to_string(recorder.ProductId().unwrap_or_default());
         let revision = bstr_to_string(recorder.ProductRevision().unwrap_or_default());
-        let model = if revision.is_empty() {
-            product
-        } else {
-            format!("{product} {revision}")
+        let volume = recorder
+            .VolumeName()
+            .ok()
+            .map(bstr_to_string)
+            .filter(|s| !s.trim().is_empty());
+        let model = match (revision.is_empty(), volume) {
+            (true, Some(v)) => format!("{product} · {v}"),
+            (false, Some(v)) => format!("{product} {revision} · {v}"),
+            (true, None) => product,
+            (false, None) => format!("{product} {revision}"),
         };
-
-        // UI path: mount point (e.g. "D:\") when available, else VolumeName, else active id.
-        // VolumePathNames is best-effort — a bad SAFEARRAY parse must not abort enumeration.
-        let path = first_volume_path(&recorder)
-            .or_else(|| {
-                recorder
-                    .VolumeName()
-                    .ok()
-                    .map(bstr_to_string)
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .unwrap_or_else(|| active_id.clone());
 
         drives.push(OpticalDrive { path, vendor, model });
     }
     Ok(drives)
 }
 
-unsafe fn first_volume_path(recorder: &IDiscRecorder2) -> Option<String> {
-    let psa = recorder.VolumePathNames().ok()?;
-    let path = first_path_from_volumepaths(psa);
-    let _ = SafeArrayDestroy(psa);
-    path
-}
-
-/// `get_VolumePathNames` returns `SAFEARRAY**` of **VARIANT** (`VT_BSTR`) elements
-/// ([MSDN](https://learn.microsoft.com/en-us/windows/win32/api/imapi2/nf-imapi2-idiscrecorder2-get_volumepathnames)).
-/// The VB sample's `For Each mountPoint In recorder.VolumePathNames` unwraps those
-/// variants automatically; raw C/Rust must not treat the elements as bare BSTRs.
-unsafe fn first_path_from_volumepaths(psa: *mut SAFEARRAY) -> Option<String> {
-    if psa.is_null() {
-        return None;
-    }
-    let lbound = SafeArrayGetLBound(psa, 1).ok()?;
-    let ubound = SafeArrayGetUBound(psa, 1).ok()?;
-    if ubound < lbound {
-        return None;
-    }
-
-    let vt = SafeArrayGetVartype(psa).ok()?;
-    let s = if vt == VT_BSTR {
-        let mut bstr = BSTR::new();
-        SafeArrayGetElement(psa, &lbound, &mut bstr as *mut BSTR as *mut _).ok()?;
-        bstr.to_string()
-    } else {
-        let mut var = VARIANT::default();
-        if SafeArrayGetElement(psa, &lbound, &mut var as *mut VARIANT as *mut _).is_err() {
-            return None;
-        }
-        let text = BSTR::try_from(&var).ok().map(|b| b.to_string());
-        drop(var);
-        text?
-    };
-
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
 fn bstr_to_string(b: BSTR) -> String {
     b.to_string()
 }
 
+/// Map our disc profiles to IMAPI physical media types for
+/// `ChooseImageDefaultsForMediaType` (see IMAPI_MEDIA_PHYSICAL_TYPE).
+fn imapi_media_type(media: DiscMedia) -> IMAPI_MEDIA_PHYSICAL_TYPE {
+    match media {
+        DiscMedia::Dvd5 => IMAPI_MEDIA_TYPE_DVDPLUSR,
+        DiscMedia::Dvd9 => IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER,
+        // IMAPI exposes BDR/BDRE only; capacity is set via FreeMediaBlocks.
+        DiscMedia::Bd25 | DiscMedia::Bd50 | DiscMedia::Bd100 => IMAPI_MEDIA_TYPE_BDR,
+    }
+}
+
 unsafe fn build_iso_file(
     stage_root: &Path,
-    disc: &DiscLayout,
+    media: DiscMedia,
+    volid: &str,
     iso_path: &Path,
-    tx: &mpsc::UnboundedSender<BurnEvent>,
+    tx: &HelperProgress,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), BurnError> {
-    let fsi: IFileSystemImage = CoCreateInstance(&MsftFileSystemImage, None, CLSCTX_ALL)
-        .map_err(|e| BurnError::Other(format!("MsftFileSystemImage: {e}")))?;
+    tx.send(BurnEvent::Progress {
+        fraction: 0.12,
+        message: "Building ISO image…".into(),
+    });
+    tx.send(BurnEvent::Log(format!(
+        "Building ISO (streamed to disk): {}",
+        iso_path.display()
+    )));
 
-    fsi.ChooseImageDefaultsForMediaType(IMAPI_MEDIA_TYPE_DISK)
+    // IMAPI2FS.MsftFileSystemImage — same object the Burning a Disc sample uses.
+    let fsi: IFileSystemImage =
+        CoCreateInstance(&MsftFileSystemImage, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| BurnError::Other(format!("MsftFileSystemImage: {e}")))?;
+
+    fsi.ChooseImageDefaultsForMediaType(imapi_media_type(media))
         .map_err(|e| BurnError::Other(format!("ChooseImageDefaultsForMediaType: {e}")))?;
 
     // ISO9660 + Joliet (Rock Ridge is Linux-specific; Windows IMAPI has no RR).
@@ -440,12 +600,16 @@ unsafe fn build_iso_file(
     // Level 3 — long file names / large files (matches Linux xorriso iso_9660_level=3).
     let _ = fsi.SetISO9660InterchangeLevel(3);
 
-    let volid = disc_volid(disc);
-    fsi.SetVolumeName(&BSTR::from(volid.as_str()))
+    let vol = if volid.trim().is_empty() {
+        "GOG_DISC".to_string()
+    } else {
+        volid.chars().take(VOLID_MAX_LEN).collect()
+    };
+    fsi.SetVolumeName(&BSTR::from(vol.as_str()))
         .map_err(|e| BurnError::Other(format!("SetVolumeName: {e}")))?;
 
     // Ensure capacity headroom for large BD layouts when creating a disc-file image.
-    let blocks = (disc.media.capacity_bytes() / 2048).max(1) as i32;
+    let blocks = (media.capacity_bytes() / 2048).max(1) as i32;
     let _ = fsi.SetFreeMediaBlocks(blocks);
 
     // Stream from source paths; do not stage a second full copy of every file.
@@ -472,7 +636,7 @@ unsafe fn build_iso_file(
     let total_bytes = total_blocks.saturating_mul(block_size);
 
     stream_to_file(&stream, iso_path, total_bytes, tx, cancel)?;
-    let _ = tx.send(BurnEvent::Log(format!(
+    tx.send(BurnEvent::Log(format!(
         "ISO ready ({:.1} MiB)",
         total_bytes as f64 / (1024.0 * 1024.0)
     )));
@@ -483,7 +647,7 @@ unsafe fn stream_to_file(
     stream: &IStream,
     iso_path: &Path,
     total_bytes: u64,
-    tx: &mpsc::UnboundedSender<BurnEvent>,
+    tx: &HelperProgress,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), BurnError> {
     let mut pos = 0u64;
@@ -517,7 +681,7 @@ unsafe fn stream_to_file(
         written += u64::from(read);
         if total_bytes > 0 {
             let frac = (written as f32 / total_bytes as f32).clamp(0.0, 1.0);
-            let _ = tx.send(BurnEvent::Progress {
+            tx.send(BurnEvent::Progress {
                 fraction: 0.12 + frac * 0.48,
                 message: format!("Building ISO… {:.0}%", frac * 100.0),
             });
@@ -538,38 +702,41 @@ unsafe fn stream_to_file(
 unsafe fn burn_iso_file(
     iso_path: &Path,
     options: &BurnOptions,
-    tx: &mpsc::UnboundedSender<BurnEvent>,
+    tx: &HelperProgress,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), BurnError> {
+    // MsftDiscMaster2 → Item → MsftDiscRecorder2 → MsftDiscFormat2Data::Write
+    // https://learn.microsoft.com/en-us/windows/win32/imapi/burning-a-disc
     let recorder = open_recorder(&options.drive)?;
 
     if options.blank {
         check_cancel(cancel).map_err(BurnError::Other)?;
-        let _ = tx.send(BurnEvent::Progress {
+        tx.send(BurnEvent::Progress {
             fraction: 0.62,
             message: "Blanking media…".into(),
         });
-        let _ = tx.send(BurnEvent::Log("Blanking RW media (quick erase)…".into()));
+        tx.send(BurnEvent::Log("Blanking RW media (quick erase)…".into()));
         // Best-effort: erase may fail on write-once blanks — ignore that.
         if let Err(err) = erase_media(&recorder) {
-            let _ = tx.send(BurnEvent::Log(format!(
+            tx.send(BurnEvent::Log(format!(
                 "NOTE: blank/erase skipped or failed ({err}); continuing write"
             )));
         }
     }
 
     check_cancel(cancel).map_err(BurnError::Other)?;
-    let _ = tx.send(BurnEvent::Progress {
+    tx.send(BurnEvent::Progress {
         fraction: 0.70,
         message: "Writing to disc…".into(),
     });
-    let _ = tx.send(BurnEvent::Log(format!(
+    tx.send(BurnEvent::Log(format!(
         "Burning ISO to {}…",
         options.drive
     )));
 
-    let data: IDiscFormat2Data = CoCreateInstance(&MsftDiscFormat2Data, None, CLSCTX_ALL)
-        .map_err(|e| BurnError::Other(format!("MsftDiscFormat2Data: {e}")))?;
+    let data: IDiscFormat2Data =
+        CoCreateInstance(&MsftDiscFormat2Data, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| BurnError::Other(format!("MsftDiscFormat2Data: {e}")))?;
     data.SetRecorder(&recorder)
         .map_err(|e| BurnError::Other(format!("SetRecorder: {e}")))?;
     data.SetClientName(&BSTR::from(CLIENT_NAME))
@@ -624,8 +791,8 @@ unsafe fn burn_iso_file(
 
     write_result.map_err(|e| BurnError::Other(format!("IDiscFormat2Data::Write failed: {e}")))?;
 
-    let _ = tx.send(BurnEvent::Log("Write completed successfully.".into()));
-    let _ = tx.send(BurnEvent::Progress {
+    tx.send(BurnEvent::Log("Write completed successfully.".into()));
+    tx.send(BurnEvent::Progress {
         fraction: 0.95,
         message: if options.verify {
             "Verifying media…".into()
@@ -635,16 +802,16 @@ unsafe fn burn_iso_file(
     });
 
     if options.eject {
-        let _ = tx.send(BurnEvent::Progress {
+        tx.send(BurnEvent::Progress {
             fraction: 0.98,
             message: "Ejecting…".into(),
         });
         if let Err(err) = recorder.EjectMedia() {
-            let _ = tx.send(BurnEvent::Log(format!("NOTE: eject failed: {err}")));
+            tx.send(BurnEvent::Log(format!("NOTE: eject failed: {err}")));
         }
     }
 
-    let _ = tx.send(BurnEvent::Progress {
+    tx.send(BurnEvent::Progress {
         fraction: 1.0,
         message: "Burn complete".into(),
     });
@@ -652,8 +819,9 @@ unsafe fn burn_iso_file(
 }
 
 unsafe fn erase_media(recorder: &IDiscRecorder2) -> Result<(), BurnError> {
-    let eraser: IDiscFormat2Erase = CoCreateInstance(&MsftDiscFormat2Erase, None, CLSCTX_ALL)
-        .map_err(|e| BurnError::Other(format!("MsftDiscFormat2Erase: {e}")))?;
+    let eraser: IDiscFormat2Erase =
+        CoCreateInstance(&MsftDiscFormat2Erase, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| BurnError::Other(format!("MsftDiscFormat2Erase: {e}")))?;
     eraser
         .SetRecorder(recorder)
         .map_err(|e| BurnError::Other(format!("erase SetRecorder: {e}")))?;
@@ -676,7 +844,6 @@ unsafe fn open_recorder(drive: &str) -> Result<IDiscRecorder2, BurnError> {
         .Count()
         .map_err(|e| BurnError::Other(format!("Count: {e}")))?;
     let needle = drive.trim();
-    let needle_trim = needle.trim_end_matches(['\\', '/']);
     for i in 0..count {
         let unique_id = match master.get_Item(i) {
             Ok(id) => id,
@@ -694,16 +861,13 @@ unsafe fn open_recorder(drive: &str) -> Result<IDiscRecorder2, BurnError> {
             .ActiveDiscRecorder()
             .map(bstr_to_string)
             .unwrap_or_else(|_| bstr_to_string(unique_id));
-        let vol = first_volume_path(&recorder).unwrap_or_default();
         let vol_name = recorder
             .VolumeName()
             .ok()
             .map(bstr_to_string)
             .unwrap_or_default();
-        let vol_trim = vol.trim_end_matches(['\\', '/']);
+        // Match unique recorder id (preferred) or VolumeName — not VolumePathNames.
         if active.eq_ignore_ascii_case(needle)
-            || vol.eq_ignore_ascii_case(needle)
-            || vol_trim.eq_ignore_ascii_case(needle_trim)
             || (!vol_name.is_empty() && vol_name.eq_ignore_ascii_case(needle))
         {
             return Ok(recorder);

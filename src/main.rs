@@ -47,6 +47,20 @@ fn main() -> ExitCode {
                 }
             };
         }
+        #[cfg(target_os = "windows")]
+        if flag == disc::BURN_JOB_FLAG {
+            let Some(job) = args.next().map(PathBuf::from) else {
+                eprintln!("usage: gog-conjure --imapi-burn-job <job.json>");
+                return ExitCode::from(2);
+            };
+            return match disc::run_burn_job_helper(&job) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("imapi-burn-job failed: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
     }
 
     if let Err(err) = run_app() {

@@ -16,7 +16,9 @@ mod macos_drutil;
 mod windows_imapi;
 
 #[cfg(target_os = "windows")]
-pub use windows_imapi::{run_list_drives_helper, LIST_DRIVES_FLAG};
+pub use windows_imapi::{
+    run_burn_job_helper, run_list_drives_helper, BURN_JOB_FLAG, LIST_DRIVES_FLAG,
+};
 
 pub use burner::{create_burner, BurnEvent, DiscBurner};
 pub use history::{AvailableDownload, BurnHistory};
