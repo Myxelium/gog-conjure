@@ -37,6 +37,16 @@ fn main() -> ExitCode {
                 }
             };
         }
+        #[cfg(target_os = "windows")]
+        if flag == disc::LIST_DRIVES_FLAG {
+            return match disc::run_list_drives_helper() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("list-optical-drives failed: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
     }
 
     if let Err(err) = run_app() {

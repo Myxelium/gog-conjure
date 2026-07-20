@@ -15,6 +15,9 @@ mod macos_drutil;
 #[cfg(target_os = "windows")]
 mod windows_imapi;
 
+#[cfg(target_os = "windows")]
+pub use windows_imapi::{run_list_drives_helper, LIST_DRIVES_FLAG};
+
 pub use burner::{create_burner, BurnEvent, DiscBurner};
 pub use history::{AvailableDownload, BurnHistory};
 pub use install::{install_xorriso, PackageManager};

@@ -267,7 +267,7 @@ impl Default for BurnOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpticalDrive {
     pub path: String,
     pub vendor: String,

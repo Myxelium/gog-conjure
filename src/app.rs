@@ -863,7 +863,9 @@ impl ConjureApp {
             }
             Err(err) => {
                 self.burn_drives.clear();
-                self.status = format!("Could not list drives: {err}");
+                self.status = format!(
+                    "Could not list optical drives (IMAPI). App will keep running. {err}"
+                );
             }
         }
     }

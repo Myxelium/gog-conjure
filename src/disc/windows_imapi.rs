@@ -5,12 +5,16 @@
 //! 2. Stream an ISO file via [`IFileSystemImage::CreateResultImage`] + chunked `IStream` reads
 //! 3. Burn that ISO with [`IDiscFormat2Data::Write`]
 //!
-//! Docs: https://learn.microsoft.com/en-us/windows/win32/imapi/burning-a-disc
+//! Drive enumeration follows Microsoft's *Checking Drive Support* sample:
+//! <https://learn.microsoft.com/en-us/windows/win32/imapi/checking-drive-support>
+//! Burn flow: <https://learn.microsoft.com/en-us/windows/win32/imapi/burning-a-disc>
+//! Overview: <https://learn.microsoft.com/en-us/windows/win32/imapi/using-imapi>
 
 use std::fs::File;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -25,13 +29,17 @@ use windows::Win32::Storage::Imapi::{
     MsftFileSystemImage,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_ALL,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, SAFEARRAY, STGM_READ, STGM_SHARE_DENY_WRITE, STREAM_SEEK_SET,
 };
 use windows::Win32::System::Ole::{
-    SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+    SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayGetVartype,
 };
+use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::Win32::UI::Shell::SHCreateStreamOnFileW;
+
+/// CLI flag for the isolated drive-enumeration helper process.
+pub const LIST_DRIVES_FLAG: &str = "--list-optical-drives";
 
 use super::burner::{BurnError, BurnEvent, DiscBurner};
 use super::models::{BurnOptions, DiscLayout, OpticalDrive};
@@ -77,9 +85,9 @@ impl DiscBurner for WindowsBurner {
     }
 
     fn list_drives(&self) -> Result<Vec<OpticalDrive>, BurnError> {
-        // Never touch COM on the egui/UI thread. eframe/winit/rfd own that apartment;
-        // CoInitializeEx/CoUninitialize there has hard-crashed this process on Windows.
-        com_on_worker(|| unsafe { list_drives_com() })
+        // IMAPI can hard-crash (AV) inside imapi2.dll. Run enumeration in a child process
+        // so a bad drive stack cannot tear down the egui UI.
+        list_drives_subprocess()
     }
 
     fn build_burn_command(
@@ -241,24 +249,45 @@ fn check_cancel(cancel: &Arc<AtomicBool>) -> Result<(), String> {
     }
 }
 
-/// Run `f` on a fresh thread with its own STA COM apartment.
-///
-/// IMAPI and the egui UI must not share a thread: initializing MTA on the UI thread (or
-/// calling `CoUninitialize` after `RPC_E_CHANGED_MODE`) can abort the process before the
-/// window appears, and again when refreshing drives.
-fn com_on_worker<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, BurnError> + Send + 'static,
-) -> Result<T, BurnError> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(with_com(f));
-    });
-    match rx.recv() {
-        Ok(result) => result,
-        Err(_) => Err(BurnError::Other(
-            "IMAPI worker thread exited before returning a result".into(),
-        )),
+/// Entry point for `gog-conjure --list-optical-drives` (no UI, own process).
+pub fn run_list_drives_helper() -> Result<(), String> {
+    let drives = with_com(|| unsafe { list_drives_com() }).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&drives).map_err(|e| e.to_string())?;
+    println!("{json}");
+    Ok(())
+}
+
+fn list_drives_subprocess() -> Result<Vec<OpticalDrive>, BurnError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| BurnError::Other(format!("resolve executable: {e}")))?;
+    let output = Command::new(&exe)
+        .arg(LIST_DRIVES_FLAG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| BurnError::Other(format!("spawn drive helper: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "crash/signal".into());
+        return Err(BurnError::Other(format!(
+            "optical drive helper failed ({code}): {}",
+            stderr.trim()
+        )));
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(trimmed)
+        .map_err(|e| BurnError::Other(format!("parse drive helper JSON: {e}")))
 }
 
 fn with_com<T>(f: impl FnOnce() -> Result<T, BurnError>) -> Result<T, BurnError> {
@@ -275,9 +304,24 @@ fn with_com<T>(f: impl FnOnce() -> Result<T, BurnError>) -> Result<T, BurnError>
     result
 }
 
+/// Enumerate recorders like the Microsoft *Checking Drive Support* sample:
+/// `MsftDiscMaster2` → `Item(i)` → `MsftDiscRecorder2.InitializeDiscRecorder` →
+/// read `VendorId` / `ProductId` / `VolumeName` / `VolumePathNames`.
 unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
-    let master: IDiscMaster2 = CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_ALL)
-        .map_err(|e| BurnError::Other(format!("IMAPI DiscMaster2 unavailable: {e}")))?;
+    let master: IDiscMaster2 =
+        CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_INPROC_SERVER).map_err(|e| {
+            BurnError::Other(format!("IMAPI DiscMaster2 unavailable: {e}"))
+        })?;
+
+    // Same gate the platform exposes before IMAPI is usable on this machine.
+    if let Ok(supported) = master.IsSupportedEnvironment() {
+        if supported == VARIANT_FALSE {
+            return Err(BurnError::Other(
+                "IMAPI reports this environment does not support optical recording".into(),
+            ));
+        }
+    }
+
     let count = master
         .Count()
         .map_err(|e| BurnError::Other(format!("DiscMaster2.Count: {e}")))?;
@@ -287,19 +331,41 @@ unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
             Ok(id) => id,
             Err(_) => continue,
         };
-        let recorder: IDiscRecorder2 = match CoCreateInstance(&MsftDiscRecorder2, None, CLSCTX_ALL)
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let recorder: IDiscRecorder2 =
+            match CoCreateInstance(&MsftDiscRecorder2, None, CLSCTX_INPROC_SERVER) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
         if recorder.InitializeDiscRecorder(&unique_id).is_err() {
             continue;
         }
+
+        // Canonical recorder id (what Burning a Disc uses to re-open the device).
+        let active_id = recorder
+            .ActiveDiscRecorder()
+            .map(bstr_to_string)
+            .unwrap_or_else(|_| bstr_to_string(unique_id));
         let vendor = bstr_to_string(recorder.VendorId().unwrap_or_default());
-        let model = bstr_to_string(recorder.ProductId().unwrap_or_default());
-        let uid = bstr_to_string(unique_id);
-        // Prefer a drive letter for the UI; fall back to the IMAPI unique id.
-        let path = first_volume_path(&recorder).unwrap_or(uid);
+        let product = bstr_to_string(recorder.ProductId().unwrap_or_default());
+        let revision = bstr_to_string(recorder.ProductRevision().unwrap_or_default());
+        let model = if revision.is_empty() {
+            product
+        } else {
+            format!("{product} {revision}")
+        };
+
+        // UI path: mount point (e.g. "D:\") when available, else VolumeName, else active id.
+        // VolumePathNames is best-effort — a bad SAFEARRAY parse must not abort enumeration.
+        let path = first_volume_path(&recorder)
+            .or_else(|| {
+                recorder
+                    .VolumeName()
+                    .ok()
+                    .map(bstr_to_string)
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| active_id.clone());
+
         drives.push(OpticalDrive { path, vendor, model });
     }
     Ok(drives)
@@ -307,12 +373,16 @@ unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
 
 unsafe fn first_volume_path(recorder: &IDiscRecorder2) -> Option<String> {
     let psa = recorder.VolumePathNames().ok()?;
-    let path = first_bstr_from_safearray(psa);
+    let path = first_path_from_volumepaths(psa);
     let _ = SafeArrayDestroy(psa);
     path
 }
 
-unsafe fn first_bstr_from_safearray(psa: *mut SAFEARRAY) -> Option<String> {
+/// `get_VolumePathNames` returns `SAFEARRAY**` of **VARIANT** (`VT_BSTR`) elements
+/// ([MSDN](https://learn.microsoft.com/en-us/windows/win32/api/imapi2/nf-imapi2-idiscrecorder2-get_volumepathnames)).
+/// The VB sample's `For Each mountPoint In recorder.VolumePathNames` unwraps those
+/// variants automatically; raw C/Rust must not treat the elements as bare BSTRs.
+unsafe fn first_path_from_volumepaths(psa: *mut SAFEARRAY) -> Option<String> {
     if psa.is_null() {
         return None;
     }
@@ -321,10 +391,22 @@ unsafe fn first_bstr_from_safearray(psa: *mut SAFEARRAY) -> Option<String> {
     if ubound < lbound {
         return None;
     }
-    // SafeArrayGetElement copies a BSTR into our out-param; BSTR drop frees it.
-    let mut bstr = BSTR::new();
-    SafeArrayGetElement(psa, &lbound, &mut bstr as *mut BSTR as *mut _).ok()?;
-    let s = bstr.to_string();
+
+    let vt = SafeArrayGetVartype(psa).ok()?;
+    let s = if vt == VT_BSTR {
+        let mut bstr = BSTR::new();
+        SafeArrayGetElement(psa, &lbound, &mut bstr as *mut BSTR as *mut _).ok()?;
+        bstr.to_string()
+    } else {
+        let mut var = VARIANT::default();
+        if SafeArrayGetElement(psa, &lbound, &mut var as *mut VARIANT as *mut _).is_err() {
+            return None;
+        }
+        let text = BSTR::try_from(&var).ok().map(|b| b.to_string());
+        drop(var);
+        text?
+    };
+
     if s.trim().is_empty() {
         None
     } else {
@@ -587,32 +669,42 @@ unsafe fn erase_media(recorder: &IDiscRecorder2) -> Result<(), BurnError> {
 }
 
 unsafe fn open_recorder(drive: &str) -> Result<IDiscRecorder2, BurnError> {
-    let master: IDiscMaster2 = CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_ALL)
+    // Same bind sequence as https://learn.microsoft.com/en-us/windows/win32/imapi/burning-a-disc
+    let master: IDiscMaster2 = CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_INPROC_SERVER)
         .map_err(|e| BurnError::Other(format!("DiscMaster2: {e}")))?;
     let count = master
         .Count()
         .map_err(|e| BurnError::Other(format!("Count: {e}")))?;
     let needle = drive.trim();
+    let needle_trim = needle.trim_end_matches(['\\', '/']);
     for i in 0..count {
         let unique_id = match master.get_Item(i) {
             Ok(id) => id,
             Err(_) => continue,
         };
-        let recorder: IDiscRecorder2 = match CoCreateInstance(&MsftDiscRecorder2, None, CLSCTX_ALL)
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let recorder: IDiscRecorder2 =
+            match CoCreateInstance(&MsftDiscRecorder2, None, CLSCTX_INPROC_SERVER) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
         if recorder.InitializeDiscRecorder(&unique_id).is_err() {
             continue;
         }
-        let uid = bstr_to_string(unique_id);
+        let active = recorder
+            .ActiveDiscRecorder()
+            .map(bstr_to_string)
+            .unwrap_or_else(|_| bstr_to_string(unique_id));
         let vol = first_volume_path(&recorder).unwrap_or_default();
+        let vol_name = recorder
+            .VolumeName()
+            .ok()
+            .map(bstr_to_string)
+            .unwrap_or_default();
         let vol_trim = vol.trim_end_matches(['\\', '/']);
-        let needle_trim = needle.trim_end_matches(['\\', '/']);
-        if uid.eq_ignore_ascii_case(needle)
+        if active.eq_ignore_ascii_case(needle)
             || vol.eq_ignore_ascii_case(needle)
             || vol_trim.eq_ignore_ascii_case(needle_trim)
+            || (!vol_name.is_empty() && vol_name.eq_ignore_ascii_case(needle))
         {
             return Ok(recorder);
         }
