@@ -24,11 +24,11 @@ use windows::core::{BSTR, Interface, PCWSTR};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::Storage::Imapi::{
     IBurnVerification, IDiscFormat2Data, IDiscFormat2Erase, IDiscMaster2, IDiscRecorder2,
-    IFileSystemImage, IFsiDirectoryItem, FsiFileSystemISO9660, FsiFileSystemJoliet, FsiFileSystems,
-    IMAPI_BURN_VERIFICATION_FULL, IMAPI_BURN_VERIFICATION_NONE, IMAPI_MEDIA_PHYSICAL_TYPE,
-    IMAPI_MEDIA_TYPE_BDR, IMAPI_MEDIA_TYPE_DVDPLUSR, IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER,
-    MsftDiscFormat2Data, MsftDiscFormat2Erase, MsftDiscMaster2, MsftDiscRecorder2,
-    MsftFileSystemImage,
+    IFileSystemImage, IFsiDirectoryItem, FsiFileSystemISO9660, FsiFileSystemJoliet,
+    FsiFileSystemUDF, FsiFileSystems, IMAPI_BURN_VERIFICATION_FULL, IMAPI_BURN_VERIFICATION_NONE,
+    IMAPI_MEDIA_PHYSICAL_TYPE, IMAPI_MEDIA_TYPE_BDR, IMAPI_MEDIA_TYPE_DVDPLUSR,
+    IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER, MsftDiscFormat2Data, MsftDiscFormat2Erase,
+    MsftDiscMaster2, MsftDiscRecorder2, MsftFileSystemImage,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_INPROC_SERVER,
@@ -69,6 +69,9 @@ const CLIENT_NAME: &str = "gog-conjure";
 const STREAM_CHUNK: usize = 1024 * 1024; // 1 MiB — keeps peak RAM bounded
 const VARIANT_FALSE: VARIANT_BOOL = VARIANT_BOOL(0);
 const VARIANT_TRUE: VARIANT_BOOL = VARIANT_BOOL(-1);
+/// IMAPI caps ISO9660/Joliet at 2 GiB per file; Level 3 is not supported for raising that
+/// limit (see https://learn.microsoft.com/en-us/windows/win32/imapi/disc-formats). Use UDF.
+const IMAPI_ISO_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// `windows` 0.61 COM interfaces are `!Send`; IMAPI write cancellation is safe across
 /// threads for a single writer, so mark this wrapper explicitly.
@@ -555,6 +558,27 @@ fn bstr_to_string(b: BSTR) -> String {
     b.to_string()
 }
 
+fn largest_file_bytes(root: &Path) -> u64 {
+    fn walk(path: &Path, max: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_file() {
+                *max = (*max).max(meta.len());
+            } else if meta.is_dir() {
+                walk(&entry.path(), max);
+            }
+        }
+    }
+    let mut max = 0u64;
+    walk(root, &mut max);
+    max
+}
+
 /// Map our disc profiles to IMAPI physical media types for
 /// `ChooseImageDefaultsForMediaType` (see IMAPI_MEDIA_PHYSICAL_TYPE).
 fn imapi_media_type(media: DiscMedia) -> IMAPI_MEDIA_PHYSICAL_TYPE {
@@ -591,14 +615,27 @@ unsafe fn build_iso_file(
     fsi.ChooseImageDefaultsForMediaType(imapi_media_type(media))
         .map_err(|e| BurnError::Other(format!("ChooseImageDefaultsForMediaType: {e}")))?;
 
-    // ISO9660 + Joliet (Rock Ridge is Linux-specific; Windows IMAPI has no RR).
-    fsi.SetFileSystemsToCreate(FsiFileSystems(
-        FsiFileSystemISO9660.0 | FsiFileSystemJoliet.0,
-    ))
-    .map_err(|e| BurnError::Other(format!("SetFileSystemsToCreate: {e}")))?;
+    // GOG installers often exceed 2 GiB. IMAPI's ISO9660/Joliet path returns
+    // IMAPI_E_DATA_TOO_BIG (0xC0AAB132) for those files — UDF is required.
+    let largest = largest_file_bytes(stage_root);
+    let filesystems = if largest >= IMAPI_ISO_MAX_FILE_BYTES {
+        tx.send(BurnEvent::Log(format!(
+            "Using UDF (largest file {:.2} GiB exceeds ISO9660/Joliet 2 GiB limit).",
+            largest as f64 / (1024.0 * 1024.0 * 1024.0)
+        )));
+        FsiFileSystems(FsiFileSystemUDF.0)
+    } else {
+        // Bridge image when every file fits ISO9660/Joliet.
+        FsiFileSystems(
+            FsiFileSystemISO9660.0 | FsiFileSystemJoliet.0 | FsiFileSystemUDF.0,
+        )
+    };
+    fsi.SetFileSystemsToCreate(filesystems)
+        .map_err(|e| BurnError::Other(format!("SetFileSystemsToCreate: {e}")))?;
 
-    // Level 3 — long file names / large files (matches Linux xorriso iso_9660_level=3).
-    let _ = fsi.SetISO9660InterchangeLevel(3);
+    if filesystems.0 & FsiFileSystemISO9660.0 != 0 {
+        let _ = fsi.SetISO9660InterchangeLevel(3);
+    }
 
     let vol = if volid.trim().is_empty() {
         "GOG_DISC".to_string()
@@ -625,9 +662,11 @@ unsafe fn build_iso_file(
     root.AddTree(&BSTR::from(stage), VARIANT_FALSE)
         .map_err(|e| BurnError::Other(format!("AddTree: {e}")))?;
 
-    let result = fsi
-        .CreateResultImage()
-        .map_err(|e| BurnError::Other(format!("CreateResultImage: {e}")))?;
+    let result = fsi.CreateResultImage().map_err(|e| {
+        BurnError::Other(format!(
+            "CreateResultImage: {e} (files >2 GiB need UDF; ISO9660/Joliet is limited by IMAPI)"
+        ))
+    })?;
     let stream = result
         .ImageStream()
         .map_err(|e| BurnError::Other(format!("ImageStream: {e}")))?;
