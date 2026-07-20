@@ -98,6 +98,8 @@ pub struct ConjureApp {
     burn_was_simulate: bool,
     installing_xorriso: bool,
     library_plan: LibraryPlanState,
+    /// Defer IMAPI drive scan until after the window exists (Windows COM safety).
+    burn_drives_pending: bool,
 }
 
 impl ConjureApp {
@@ -118,11 +120,9 @@ impl ConjureApp {
         let queue = DownloadQueue::new(config.max_concurrent_downloads, queue_tx);
 
         let burner = create_burner();
-        let burn_drives = burner.list_drives().unwrap_or_default();
-        let mut burn_default_options = BurnOptions::default();
-        if let Some(first) = burn_drives.first() {
-            burn_default_options.drive = first.path.clone();
-        }
+        // Do not call list_drives() here. On Windows, IMAPI/COM during eframe creation has
+        // aborted the process before the GUI appears; scan once the first frame runs.
+        let burn_default_options = BurnOptions::default();
 
         let mut app = Self {
             runtime,
@@ -157,7 +157,7 @@ impl ConjureApp {
             burn_available: Vec::new(),
             burn_available_filter: String::new(),
             burner,
-            burn_drives,
+            burn_drives: Vec::new(),
             burn_rx: None,
             burn_cancel: None,
             burn_active_disc: None,
@@ -167,6 +167,7 @@ impl ConjureApp {
             burn_was_simulate: false,
             installing_xorriso: false,
             library_plan: LibraryPlanState::default(),
+            burn_drives_pending: true,
         };
 
         app.refresh_available_downloads();
@@ -1355,6 +1356,12 @@ impl ConjureApp {
 
 impl eframe::App for ConjureApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Scan optical drives only once the Burn tab is used — keeps a broken IMAPI stack
+        // from taking down library/download flows at startup.
+        if self.burn_drives_pending && self.tab == Tab::Burn {
+            self.burn_drives_pending = false;
+            self.refresh_burn_drives();
+        }
         self.poll_channels(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 

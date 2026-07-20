@@ -14,6 +14,8 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
+    install_panic_hook();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -62,4 +64,31 @@ fn run_app() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Ok(Box::new(app::ConjureApp::new(cc)))),
     )
+}
+
+/// Write panics to `%APPDATA%\gog-conjure\gog-conjure\crash.log` (and stderr) so a
+/// console-flash exit on Windows still leaves a breadcrumb.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".into());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".into()
+        };
+        let body = format!("gog-conjure panic at {location}\n{payload}\n");
+        eprintln!("{body}");
+        if let Ok(dir) = config::config_dir() {
+            let path = dir.join("crash.log");
+            let _ = std::fs::write(&path, &body);
+            eprintln!("panic details written to {}", path.display());
+        }
+        default_hook(info);
+    }));
 }

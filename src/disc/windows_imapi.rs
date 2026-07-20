@@ -25,10 +25,12 @@ use windows::Win32::Storage::Imapi::{
     MsftFileSystemImage,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_ALL, COINIT_MULTITHREADED,
-    SAFEARRAY, STGM_READ, STGM_SHARE_DENY_WRITE, STREAM_SEEK_SET,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_ALL,
+    COINIT_APARTMENTTHREADED, SAFEARRAY, STGM_READ, STGM_SHARE_DENY_WRITE, STREAM_SEEK_SET,
 };
-use windows::Win32::System::Ole::{SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound};
+use windows::Win32::System::Ole::{
+    SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+};
 use windows::Win32::UI::Shell::SHCreateStreamOnFileW;
 
 use super::burner::{BurnError, BurnEvent, DiscBurner};
@@ -75,7 +77,9 @@ impl DiscBurner for WindowsBurner {
     }
 
     fn list_drives(&self) -> Result<Vec<OpticalDrive>, BurnError> {
-        with_com(|| unsafe { list_drives_com() })
+        // Never touch COM on the egui/UI thread. eframe/winit/rfd own that apartment;
+        // CoInitializeEx/CoUninitialize there has hard-crashed this process on Windows.
+        com_on_worker(|| unsafe { list_drives_com() })
     }
 
     fn build_burn_command(
@@ -237,12 +241,31 @@ fn check_cancel(cancel: &Arc<AtomicBool>) -> Result<(), String> {
     }
 }
 
+/// Run `f` on a fresh thread with its own STA COM apartment.
+///
+/// IMAPI and the egui UI must not share a thread: initializing MTA on the UI thread (or
+/// calling `CoUninitialize` after `RPC_E_CHANGED_MODE`) can abort the process before the
+/// window appears, and again when refreshing drives.
+fn com_on_worker<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, BurnError> + Send + 'static,
+) -> Result<T, BurnError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(with_com(f));
+    });
+    match rx.recv() {
+        Ok(result) => result,
+        Err(_) => Err(BurnError::Other(
+            "IMAPI worker thread exited before returning a result".into(),
+        )),
+    }
+}
+
 fn with_com<T>(f: impl FnOnce() -> Result<T, BurnError>) -> Result<T, BurnError> {
-    // S_OK / S_FALSE both mean we must pair with CoUninitialize.
-    // RPC_E_CHANGED_MODE means this thread already has a different apartment (typical after
-    // an STA file dialog on the UI thread) — COM is usable, but CoUninitialize must not run
-    // or it tears down someone else's apartment and can hard-crash the process.
-    let should_uninit = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    // Prefer STA — IMAPI samples and shell-adjacent COM expect apartment threading.
+    // S_OK / S_FALSE → we own a matching CoUninitialize. RPC_E_CHANGED_MODE means this
+    // thread already has another apartment; COM is usable, but we must not uninitialize it.
+    let should_uninit = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     let result = f();
     if should_uninit {
         unsafe {
@@ -284,7 +307,9 @@ unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
 
 unsafe fn first_volume_path(recorder: &IDiscRecorder2) -> Option<String> {
     let psa = recorder.VolumePathNames().ok()?;
-    first_bstr_from_safearray(psa)
+    let path = first_bstr_from_safearray(psa);
+    let _ = SafeArrayDestroy(psa);
+    path
 }
 
 unsafe fn first_bstr_from_safearray(psa: *mut SAFEARRAY) -> Option<String> {
