@@ -36,6 +36,7 @@ impl BurnHistory {
     pub fn mark_burned(&mut self, game_ids: impl IntoIterator<Item = u64>) {
         let mut set = self.burned_set();
         for id in game_ids {
+            // Skip invalid sentinel; GOG and synthetic local ids are both non-zero.
             if id != 0 {
                 set.insert(id);
             }
@@ -45,6 +46,7 @@ impl BurnHistory {
     }
 
     pub fn remember_download(&mut self, game_id: u64, title: String) {
+        // Skip invalid sentinel; local folders use synthetic non-zero ids.
         if game_id == 0 {
             return;
         }

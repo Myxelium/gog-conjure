@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::history::{AvailableDownload, BurnHistory};
+use super::local_id::{is_local_game_id, local_game_id};
 use super::media::DiscMedia;
 use super::models::{
     BurnFile, BurnListEntry, BurnOptions, BurnPlan, BurnUnit, DiscBurnStatus, DiscLayout,
@@ -33,7 +34,7 @@ pub fn plan_into_discs(
 
     let max_cap = discs
         .iter()
-        .map(|d| d.media.capacity_bytes())
+        .map(|d| d.usable_capacity_bytes())
         .max()
         .unwrap_or(0);
 
@@ -44,7 +45,7 @@ pub fn plan_into_discs(
     for disc in &mut discs {
         disc.units.clear();
         disc.used_bytes = 0;
-        disc.remaining_bytes = disc.media.capacity_bytes();
+        disc.remaining_bytes = disc.usable_capacity_bytes();
         disc.last_error = None;
         if !matches!(disc.status, DiscBurnStatus::Burning) {
             disc.status = DiscBurnStatus::Empty;
@@ -54,7 +55,7 @@ pub fn plan_into_discs(
         }
     }
 
-    let capacities: Vec<u64> = discs.iter().map(|d| d.media.capacity_bytes()).collect();
+    let capacities: Vec<u64> = discs.iter().map(|d| d.usable_capacity_bytes()).collect();
     let mut bins: Vec<Vec<BurnUnit>> = discs.iter().map(|_| Vec::new()).collect();
     let mut used: Vec<u64> = vec![0; discs.len()];
 
@@ -615,6 +616,9 @@ pub fn list_available_downloads(
         title_to_id.insert(key, (*id, title.clone()));
     }
     for known in &history.known_downloads {
+        if known.game_id == 0 {
+            continue;
+        }
         let key = sanitize_filename::sanitize(&known.title).to_lowercase();
         title_to_id
             .entry(key)
@@ -634,10 +638,21 @@ pub fn list_available_downloads(
                 if size == 0 {
                     continue;
                 }
-                let (game_id, title) = title_to_id
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or((0, name.clone()));
+                let (game_id, title) = title_to_id.get(&key).cloned().unwrap_or_else(|| {
+                    // Unmatched folder: stable synthetic id + folder name as title.
+                    (local_game_id(&name), name.clone())
+                });
+                // Ignore stale history entries that still used the old id-0 sentinel.
+                let game_id = if game_id == 0 {
+                    local_game_id(&name)
+                } else {
+                    game_id
+                };
+                let title = if is_local_game_id(game_id) {
+                    name.clone()
+                } else {
+                    title
+                };
                 by_folder.insert(
                     key,
                     AvailableDownload {
@@ -655,6 +670,9 @@ pub fn list_available_downloads(
 
     // Remembered downloads whose folders still exist but weren't scanned (edge cases).
     for known in &history.known_downloads {
+        if known.game_id == 0 {
+            continue;
+        }
         let folder = root.join(sanitize_filename::sanitize(&known.title));
         if !folder.is_dir() {
             continue;
@@ -985,5 +1003,45 @@ mod tests {
         );
         assert!(err.is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unmatched_folders_get_distinct_local_ids() {
+        let root = test_dir("locals");
+        for name in ["LocalAlpha", "LocalBeta"] {
+            let g = root.join(name);
+            fs::create_dir_all(&g).unwrap();
+            fs::write(g.join("data.bin"), b"hello").unwrap();
+        }
+        let history = BurnHistory::default();
+        let on_list = std::collections::HashSet::new();
+        let available = list_available_downloads(&root, &[], &history, &on_list);
+        assert_eq!(available.len(), 2);
+        assert!(available.iter().all(|a| is_local_game_id(a.game_id)));
+        assert_ne!(available[0].game_id, available[1].game_id);
+        assert!(available.iter().any(|a| a.title == "LocalAlpha"));
+        assert!(available.iter().any(|a| a.title == "LocalBeta"));
+
+        let entries: Vec<_> = available
+            .iter()
+            .map(|a| {
+                entry(
+                    a.game_id,
+                    &a.title,
+                    a.folder.clone(),
+                    a.size_bytes,
+                    SplitPolicy::Never,
+                )
+            })
+            .collect();
+        let plan = plan_homogeneous_discs(
+            DiscMedia::Dvd5,
+            &entries,
+            SplitPolicy::Never,
+            BurnOptions::default(),
+        );
+        assert!(plan.blockers.is_empty());
+        assert_eq!(plan.discs[0].units.len(), 2);
+        let _ = fs::remove_dir_all(&root);
     }
 }

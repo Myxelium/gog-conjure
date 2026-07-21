@@ -9,10 +9,11 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::auth::{self, AuthState, LoginOutcome};
 use crate::config::AppConfig;
 use crate::disc::{
-    create_burner, folder_size, install_xorriso, list_available_downloads, plan_homogeneous_discs,
-    plan_into_discs, planned_files_from_download_files, resolve_disc_file_paths, AvailableDownload,
-    BurnEvent, BurnHistory, BurnListEntry, BurnOptions, BurnPlan, DiscBurner, DiscBurnStatus,
-    DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive, PackageManager, SplitPolicy,
+    create_burner, folder_size, install_xorriso, is_local_game_id, list_available_downloads,
+    plan_homogeneous_discs, plan_into_discs, planned_files_from_download_files,
+    resolve_disc_file_paths, AvailableDownload, BurnEvent, BurnHistory, BurnListEntry, BurnOptions,
+    BurnPlan, DiscBurner, DiscBurnStatus, DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive,
+    PackageManager, SplitPolicy,
 };
 use crate::download::{game_folder, DownloadQueue, JobStatus, QueueEvent, QueueItem};
 use crate::gog::{DownloadFile, GameDetails, GogClient, LibraryGame};
@@ -339,15 +340,13 @@ impl ConjureApp {
         } else {
             planned_size
         };
-        self.burn_history.remember_download(game_id, title.clone());
-        let _ = self.burn_history.save();
+        if game_id != 0 {
+            self.burn_history.remember_download(game_id, title.clone());
+            let _ = self.burn_history.save();
+        }
 
-        if let Some(existing) = self
-            .burn_list
-            .iter_mut()
-            .find(|e| e.game_id == game_id || (game_id == 0 && e.title == title))
-        {
-            existing.game_id = if game_id != 0 { game_id } else { existing.game_id };
+        if let Some(existing) = self.burn_list.iter_mut().find(|e| e.game_id == game_id) {
+            // Re-add: refresh size/folder/files in place; no duplicates.
             existing.title = title;
             existing.folder = folder;
             existing.size_bytes = size;
@@ -385,7 +384,7 @@ impl ConjureApp {
         if let Some(entry) = self
             .burn_list
             .iter_mut()
-            .find(|e| e.game_id == game.game_id || e.folder == game.folder)
+            .find(|e| e.game_id == game.game_id)
         {
             entry.folder = game.folder;
             entry.size_bytes = game.size_bytes;
@@ -423,17 +422,15 @@ impl ConjureApp {
         let on_list: HashSet<u64> = self.burn_list.iter().map(|e| e.game_id).collect();
         self.burn_available =
             list_available_downloads(&root, &library, &self.burn_history, &on_list);
-        // Also mark on_burn_list by title/folder when game_id is 0.
+        // Folder equality as a safety net if ids ever diverge mid-session.
         for avail in &mut self.burn_available {
             if !avail.on_burn_list {
-                avail.on_burn_list = self.burn_list.iter().any(|e| {
-                    e.folder == avail.folder
-                        || (e.title.eq_ignore_ascii_case(&avail.title))
-                });
+                avail.on_burn_list = self
+                    .burn_list
+                    .iter()
+                    .any(|e| e.folder == avail.folder);
             }
-            if avail.game_id != 0 {
-                avail.burned = self.burn_history.is_burned(avail.game_id);
-            }
+            avail.burned = self.burn_history.is_burned(avail.game_id);
         }
     }
 
@@ -885,54 +882,24 @@ impl ConjureApp {
         let mut jobs: Vec<(u64, String, Vec<String>)> = Vec::new();
         let mut seen = HashSet::new();
         for unit in &disc.units {
-            let entry = self.burn_list.iter().find(|e| {
-                (unit.game_id != 0 && e.game_id == unit.game_id) || e.title == unit.game_title
-            });
-            let Some(entry) = entry else {
-                continue;
-            };
-            if matches!(
-                entry.readiness,
-                DownloadReadiness::Ready | DownloadReadiness::Downloading
-            ) {
-                continue;
-            }
-            let key = if entry.game_id != 0 {
-                entry.game_id
-            } else {
-                // Deduplicate title-only entries by a synthetic key from title bytes.
-                continue;
-            };
-            if !seen.insert(key) {
-                continue;
-            }
-            let planned_names: Vec<String> = entry
-                .planned_files
-                .iter()
-                .map(|f| f.relative_name.clone())
-                .collect();
-            jobs.push((entry.game_id, entry.title.clone(), planned_names));
-        }
-
-        // Title-only fallback (game_id == 0).
-        for unit in &disc.units {
-            if unit.game_id != 0 {
-                continue;
-            }
             let entry = self
                 .burn_list
                 .iter()
-                .find(|e| e.title == unit.game_title && e.game_id == 0);
+                .find(|e| e.game_id == unit.game_id);
             let Some(entry) = entry else {
                 continue;
             };
+            // Local folders are on-disk only — never call the GOG API for them.
+            if is_local_game_id(entry.game_id) || entry.game_id == 0 {
+                continue;
+            }
             if matches!(
                 entry.readiness,
                 DownloadReadiness::Ready | DownloadReadiness::Downloading
             ) {
                 continue;
             }
-            if jobs.iter().any(|(_, t, _)| t == &entry.title) {
+            if !seen.insert(entry.game_id) {
                 continue;
             }
             let planned_names: Vec<String> = entry
@@ -1045,7 +1012,7 @@ impl ConjureApp {
             let ready = self
                 .burn_list
                 .iter()
-                .find(|e| e.game_id == unit.game_id || e.title == unit.game_title)
+                .find(|e| e.game_id == unit.game_id)
                 .map(|e| e.readiness == DownloadReadiness::Ready)
                 .unwrap_or_else(|| {
                     // Available download only — treat existing folder as ready.

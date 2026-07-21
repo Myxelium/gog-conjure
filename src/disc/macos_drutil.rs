@@ -424,6 +424,7 @@ mod tests {
             simulate: false,
             blank: true,
             eject: true,
+            defect_management: false,
         };
         let argv = build_argv("drutil", &disc, &opts, Path::new("/tmp/stage"));
         assert!(argv.windows(2).any(|w| w[0] == "-drive" && w[1] == "1"));

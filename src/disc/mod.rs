@@ -3,6 +3,7 @@
 mod burner;
 mod history;
 mod install;
+mod local_id;
 mod media;
 mod models;
 mod pack;
@@ -22,6 +23,7 @@ pub use windows_imapi::{
 
 pub use burner::{create_burner, BurnEvent, DiscBurner};
 pub use history::{AvailableDownload, BurnHistory};
+pub use local_id::is_local_game_id;
 pub use install::{install_xorriso, PackageManager};
 pub use media::DiscMedia;
 pub use models::{

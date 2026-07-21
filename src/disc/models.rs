@@ -162,7 +162,7 @@ pub struct DiscLayout {
 
 impl DiscLayout {
     pub fn new_empty(index: usize, media: DiscMedia, options: BurnOptions) -> Self {
-        let capacity = media.capacity_bytes();
+        let capacity = media.capacity_for_burn(options.defect_management);
         Self {
             index,
             media,
@@ -177,18 +177,29 @@ impl DiscLayout {
         }
     }
 
+    /// Usable bytes for planning/burning, honoring BD defect-management spare.
+    pub fn usable_capacity_bytes(&self) -> u64 {
+        self.media
+            .capacity_for_burn(self.options.defect_management)
+    }
+
     pub fn used_label(&self) -> String {
         format!(
             "{} / {} ({} free)",
             format_bytes(self.used_bytes),
-            format_bytes(self.media.capacity_bytes()),
+            format_bytes(self.usable_capacity_bytes()),
             format_bytes(self.remaining_bytes)
         )
     }
 
     pub fn fill_fraction(&self) -> f32 {
-        let cap = self.media.capacity_bytes().max(1) as f32;
-        (self.used_bytes as f32 / cap).clamp(0.0, 1.0)
+        let cap = self.usable_capacity_bytes().max(1) as f64;
+        let frac = self.used_bytes as f64 / cap;
+        if frac.is_finite() {
+            (frac as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 
     pub fn game_titles(&self) -> Vec<String> {
@@ -218,7 +229,7 @@ impl DiscLayout {
     }
 
     pub fn recompute_usage(&mut self) {
-        let capacity = self.media.capacity_bytes();
+        let capacity = self.usable_capacity_bytes();
         self.used_bytes = self.units.iter().map(|u| u.size_bytes).sum();
         self.remaining_bytes = capacity.saturating_sub(self.used_bytes);
         if self.units.is_empty()
@@ -251,6 +262,9 @@ pub struct BurnOptions {
     pub simulate: bool,
     pub blank: bool,
     pub eject: bool,
+    /// BD-R/RE: format with Defect Management spare area (slower, less capacity).
+    #[serde(default)]
+    pub defect_management: bool,
 }
 
 impl Default for BurnOptions {
@@ -263,6 +277,8 @@ impl Default for BurnOptions {
             // Safer default for DVD+RW / BD-RE that still have old sessions.
             blank: true,
             eject: true,
+            // Off by default so nearly-full BD plans keep full media capacity.
+            defect_management: false,
         }
     }
 }

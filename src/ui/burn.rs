@@ -1,8 +1,8 @@
 use egui::{RichText, ScrollArea, TextEdit, Ui};
 
 use crate::disc::{
-    sanitize_volid, AvailableDownload, BurnListEntry, BurnPlan, DiscBurnStatus, DiscLayout,
-    DiscMedia, DownloadReadiness, OpticalDrive, SplitPolicy, VOLID_MAX_LEN,
+    is_local_game_id, sanitize_volid, AvailableDownload, BurnListEntry, BurnPlan, DiscBurnStatus,
+    DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive, SplitPolicy, VOLID_MAX_LEN,
 };
 use crate::gog::format_bytes;
 use crate::theme::{PRIMARY_BTN, SIDE_BTN};
@@ -96,9 +96,9 @@ impl BurnPanel {
 
         ui.add_space(4.0);
 
-        let full = ui.available_width();
-        let left_w = (full * 0.40).clamp(280.0, 440.0);
-        let body_h = ui.available_height();
+        let full = ui.available_width().max(1.0);
+        let left_w = (full * 0.40).clamp(280.0, 440.0).min(full);
+        let body_h = ui.available_height().max(1.0);
 
         ui.horizontal_top(|ui| {
             // ── Left: library of downloads + burn queue ──
@@ -124,8 +124,10 @@ impl BurnPanel {
             ui.separator();
 
             // ── Right: discs ──
+            let right_w = ui.available_width().max(1.0);
+            let right_h = ui.available_height().max(1.0);
             ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), ui.available_height()),
+                egui::vec2(right_w, right_h),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     show_discs_header(
@@ -151,6 +153,18 @@ impl BurnPanel {
                         ui.add_space(4.0);
                     }
 
+                    // Progress footer must be reserved *before* the discs ScrollArea.
+                    // Otherwise the scroll area eats all remaining height and the footer
+                    // gets zero-sized (NaN) rects, which panics egui hit-testing.
+                    let show_burn_progress =
+                        burning || !burn_log.is_empty() || burn_progress.is_some();
+                    let progress_footer_h = if show_burn_progress {
+                        let log_h = if burn_log.is_empty() { 0.0 } else { 140.0 };
+                        8.0 + 22.0 + 22.0 + log_h // separator + label + bar + optional log
+                    } else {
+                        0.0
+                    };
+
                     if plan.discs.is_empty() {
                         ui.add_space(24.0);
                         ui.vertical_centered(|ui| {
@@ -161,16 +175,20 @@ impl BurnPanel {
                         let mut burn_clicked = None;
                         let mut download_disc = None;
                         let mut remove_disc = None;
+                        let scroll_h = (ui.available_height() - progress_footer_h).max(80.0);
                         ScrollArea::vertical()
                             .id_salt("burn_discs_scroll")
+                            .max_height(scroll_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                for disc in &mut plan.discs {
-                                    let idx = disc.index;
+                                for (idx, disc) in plan.discs.iter_mut().enumerate() {
+                                    // Keep index aligned with Vec position (burn_active_disc uses this).
+                                    disc.index = idx;
                                     egui::Frame::group(ui.style())
                                         .inner_margin(egui::Margin::same(10))
                                         .show(ui, |ui| {
-                                            let is_active = burning
-                                                && burn_active_disc == Some(disc.index);
+                                            let is_active =
+                                                burning && burn_active_disc == Some(idx);
                                             let downloads_ready = disc.units.iter().all(|u| {
                                                 burn_list
                                                     .iter()
@@ -195,8 +213,6 @@ impl BurnPanel {
                                                 unavailable,
                                                 burning,
                                                 is_active,
-                                                burn_progress,
-                                                burn_progress_text,
                                                 plan.blockers.is_empty(),
                                                 downloads_ready,
                                                 need_download_count,
@@ -207,7 +223,6 @@ impl BurnPanel {
                                             );
                                         });
                                     ui.add_space(8.0);
-                                    let _ = idx;
                                 }
                             });
                         actions.burn_disc = burn_clicked;
@@ -215,22 +230,23 @@ impl BurnPanel {
                         actions.remove_disc = remove_disc;
                     }
 
-                    if burning || !burn_log.is_empty() || burn_progress.is_some() {
+                    if show_burn_progress {
                         ui.separator();
-                        ui.label(RichText::new("Burn progress").strong());
+                        let disc_label = burn_active_disc
+                            .map(|i| format!("Disc {} burn progress", i + 1))
+                            .unwrap_or_else(|| "Burn progress".into());
+                        ui.label(RichText::new(disc_label).strong());
                         if let Some(p) = burn_progress {
+                            let p = finite_unit_interval(p);
                             let text = if burn_progress_text.is_empty() {
-                                format!("{:.0}%", p.clamp(0.0, 1.0) * 100.0)
+                                format!("{:.0}%", p * 100.0)
                             } else {
-                                format!(
-                                    "{:.0}% — {}",
-                                    p.clamp(0.0, 1.0) * 100.0,
-                                    burn_progress_text
-                                )
+                                format!("{:.0}% — {burn_progress_text}", p * 100.0)
                             };
+                            let bar_w = ui.available_width().max(1.0);
                             ui.add(
-                                egui::ProgressBar::new(p.clamp(0.0, 1.0))
-                                    .desired_width(f32::INFINITY)
+                                egui::ProgressBar::new(p)
+                                    .desired_width(bar_w)
                                     .text(text),
                             );
                         } else if burning {
@@ -501,29 +517,25 @@ fn show_discs_header(
 
 #[allow(clippy::too_many_arguments)]
 /// Games on a disc that are neither Ready nor currently Downloading.
+/// Local (non-GOG) folders are excluded — they cannot be fetched via the API.
 fn disc_games_needing_download<'a>(
     disc: &DiscLayout,
     burn_list: &'a [BurnListEntry],
 ) -> Vec<&'a BurnListEntry> {
     let mut seen_ids = std::collections::HashSet::new();
-    let mut seen_titles = std::collections::HashSet::new();
     let mut out = Vec::new();
     for unit in &disc.units {
-        let entry = burn_list.iter().find(|e| {
-            (unit.game_id != 0 && e.game_id == unit.game_id) || e.title == unit.game_title
-        });
+        let entry = burn_list.iter().find(|e| e.game_id == unit.game_id);
         let Some(entry) = entry else {
             continue;
         };
+        if is_local_game_id(entry.game_id) || entry.game_id == 0 {
+            continue;
+        }
         if !needs_download(entry) {
             continue;
         }
-        let dup = if entry.game_id != 0 {
-            !seen_ids.insert(entry.game_id)
-        } else {
-            !seen_titles.insert(entry.title.as_str())
-        };
-        if !dup {
+        if seen_ids.insert(entry.game_id) {
             out.push(entry);
         }
     }
@@ -537,6 +549,15 @@ fn needs_download(entry: &BurnListEntry) -> bool {
     )
 }
 
+/// egui hit-testing panics if progress/layout values become NaN.
+fn finite_unit_interval(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn show_disc_card(
     ui: &mut Ui,
     disc: &mut DiscLayout,
@@ -545,8 +566,43 @@ fn show_disc_card(
     unavailable: Option<&str>,
     burning: bool,
     is_active_burn: bool,
-    burn_progress: Option<f32>,
-    burn_progress_text: &str,
+    plan_ok: bool,
+    downloads_ready: bool,
+    need_download_count: usize,
+    burn_clicked: &mut Option<usize>,
+    download_clicked: &mut Option<usize>,
+    remove_disc: &mut Option<usize>,
+    refresh_drives: &mut bool,
+) {
+    // Isolate widget IDs per disc (combos / buttons).
+    ui.push_id(disc.index, |ui| {
+        show_disc_card_inner(
+            ui,
+            disc,
+            drives,
+            backend_ok,
+            unavailable,
+            burning,
+            is_active_burn,
+            plan_ok,
+            downloads_ready,
+            need_download_count,
+            burn_clicked,
+            download_clicked,
+            remove_disc,
+            refresh_drives,
+        );
+    });
+}
+
+fn show_disc_card_inner(
+    ui: &mut Ui,
+    disc: &mut DiscLayout,
+    drives: &[OpticalDrive],
+    backend_ok: bool,
+    unavailable: Option<&str>,
+    burning: bool,
+    is_active_burn: bool,
     plan_ok: bool,
     downloads_ready: bool,
     need_download_count: usize,
@@ -575,7 +631,14 @@ fn show_disc_card(
                     }
                 }
             });
-        ui.weak(disc.status.label());
+        let status_text = if is_active_burn {
+            "Burning…"
+        } else if burning {
+            "Waiting…"
+        } else {
+            disc.status.label()
+        };
+        ui.weak(status_text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add_enabled(!burning, egui::Button::new("Remove").min_size(SIDE_BTN))
@@ -586,7 +649,22 @@ fn show_disc_card(
         });
     });
 
-    ui.add(egui::ProgressBar::new(disc.fill_fraction()).text(disc.used_label()));
+    // Capacity as text only — ProgressBar widgets were mistaken for burn progress
+    // (and can visually "update" on every burn log repaint).
+    ui.label(RichText::new(disc.used_label()).weak());
+    let fill = finite_unit_interval(disc.fill_fraction());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(1.0), 6.0),
+        egui::Sense::hover(),
+    );
+    if ui.is_rect_visible(rect) {
+        let bg = ui.visuals().extreme_bg_color;
+        let fg = ui.visuals().widgets.inactive.bg_fill;
+        ui.painter().rect_filled(rect, 2.0, bg);
+        let mut filled = rect;
+        filled.set_width((rect.width() * fill).max(0.0));
+        ui.painter().rect_filled(filled, 2.0, fg);
+    }
 
     ui.horizontal(|ui| {
         ui.label("Volume");
@@ -662,22 +740,24 @@ fn show_disc_card(
             .on_hover_text("Blank rewriteable media before writing (ignored in Simulate)");
         ui.checkbox(&mut disc.options.eject, "Eject")
             .on_hover_text("Eject after a real burn (ignored in Simulate)");
+        if disc.media.is_bluray() {
+            let prev = disc.options.defect_management;
+            ui.checkbox(&mut disc.options.defect_management, "Defect spare")
+                .on_hover_text(
+                    "Format BD with Defect Management spare area. More resilient, but ~1–3 GB less capacity and about half write speed. Re-Plan after changing.",
+                );
+            if disc.options.defect_management != prev {
+                disc.recompute_usage();
+            }
+        }
     });
 
     if is_active_burn {
-        ui.add_space(6.0);
-        ui.label(RichText::new("Burning…").strong());
-        let p = burn_progress.unwrap_or(0.0).clamp(0.0, 1.0);
-        let text = if burn_progress_text.is_empty() {
-            format!("{:.0}%", p * 100.0)
-        } else {
-            format!("{:.0}% — {burn_progress_text}", p * 100.0)
-        };
-        ui.add(
-            egui::ProgressBar::new(p)
-                .desired_width(f32::INFINITY)
-                .animate(true)
-                .text(text),
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Burn in progress — see Burn progress below.")
+                .strong()
+                .color(ui.visuals().warn_fg_color),
         );
     }
 

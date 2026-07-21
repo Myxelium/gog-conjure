@@ -245,7 +245,7 @@ pub fn build_argv(
         options.drive.clone()
     };
 
-    // Skip id 0 — scanned folders without a library match share that sentinel.
+    // Include GOG and synthetic local ids; only the invalid 0 sentinel is skipped.
     let folder_by_id: HashMap<u64, &PathBuf> = game_folders
         .iter()
         .filter(|(id, _)| *id != 0)
@@ -289,6 +289,15 @@ pub fn build_argv(
         if !options.simulate {
             args.extend(["-speed".into(), speed.to_string()]);
         }
+    }
+    // BD-R: pre-format before writing (helps OPC on some drives; matches K3B/growisofs).
+    if !options.simulate && disc.media.is_bluray() {
+        let mode = if options.defect_management {
+            "as_needed"
+        } else {
+            "without_spare"
+        };
+        args.extend(["-format".into(), mode.into()]);
     }
 
     // Map files onto the ISO. Whole-game (unsplit) units map the folder once.
@@ -519,6 +528,17 @@ fn hint_for_xorriso_failure(detail: &str) -> String {
     if lower.contains("no such file") || lower.contains("cannot determine attributes") {
         return " A source file/folder is missing — refresh downloads and Plan again.".into();
     }
+    if lower.contains("power calibration") || lower.contains("73 03") {
+        return " The drive rejected laser calibration on this disc — try a fresh blank and a different BD-R brand if it persists.".into();
+    }
+    if lower.contains("exceeds free space") {
+        return " The image is larger than usable space on this disc — Plan again (BD capacities leave headroom), and use a fresh blank (already-formatted BD-R cannot regain spare area).".into();
+    }
+    if lower.contains("invalid command operation code")
+        || lower.contains("cannot reserve track")
+    {
+        return " The drive rejected a write command — confirm it can write BD-R (not read-only), then try a fresh blank disc.".into();
+    }
     if detail.is_empty() {
         return " See Burn progress log for details.".into();
     }
@@ -677,6 +697,7 @@ mod tests {
             simulate: false,
             blank: true,
             eject: true,
+            defect_management: false,
         };
         let folders = vec![(1u64, game_dir.clone())];
         let argv = build_argv("xorriso", &disc, &opts, &folders).unwrap();
@@ -688,6 +709,9 @@ mod tests {
         assert!(argv.contains(&"-eject".into()));
         assert!(argv.contains(&"-rockridge".into()));
         assert!(argv.contains(&"-md5".into()));
+        assert!(!argv.iter().any(|a| a == "-write_type"));
+        assert!(!argv.iter().any(|a| a == "-stream_recording"));
+        assert!(!argv.iter().any(|a| a == "-format")); // DVD, not BD
         assert!(argv.windows(2).any(|w| w[0] == "-check_media" && w[1] == "--"));
         // Regression: old builds passed the invalid token "default".
         assert!(!argv.iter().any(|a| a == "default"));
@@ -695,6 +719,22 @@ mod tests {
         assert!(argv.windows(3).any(|w| {
             w[0] == "-map" && w[1] == game_dir.display().to_string() && w[2].contains("My Game")
         }));
+
+        let mut bd_disc = disc.clone();
+        bd_disc.media = DiscMedia::Bd50;
+        let argv_bd = build_argv("xorriso", &bd_disc, &opts, &folders).unwrap();
+        assert!(!argv_bd.iter().any(|a| a == "-write_type"));
+        assert!(!argv_bd.iter().any(|a| a == "-stream_recording"));
+        assert!(argv_bd
+            .windows(2)
+            .any(|w| w[0] == "-format" && w[1] == "without_spare"));
+
+        let mut opts_spare = opts.clone();
+        opts_spare.defect_management = true;
+        let argv_spare = build_argv("xorriso", &bd_disc, &opts_spare, &folders).unwrap();
+        assert!(argv_spare
+            .windows(2)
+            .any(|w| w[0] == "-format" && w[1] == "as_needed"));
 
         // Simulate must not touch the optical drive (avoids MMC dummy failures).
         let sim = BurnOptions {
@@ -704,12 +744,15 @@ mod tests {
             simulate: true,
             blank: true,
             eject: true,
+            defect_management: false,
         };
         let argv_sim = build_argv("xorriso", &disc, &sim, &folders).unwrap();
         assert!(argv_sim.iter().any(|a| a.starts_with("stdio:")));
         assert!(!argv_sim.iter().any(|a| a == "/dev/sr0"));
         assert!(!argv_sim.iter().any(|a| a == "-dummy"));
         assert!(!argv_sim.iter().any(|a| a == "-eject"));
+        assert!(!argv_sim.iter().any(|a| a == "-write_type"));
+        assert!(!argv_sim.iter().any(|a| a == "-format"));
         assert!(!argv_sim.iter().any(|a| a == "default"));
         assert!(argv_sim.windows(2).any(|w| w[0] == "-check_media" && w[1] == "--"));
 

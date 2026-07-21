@@ -37,6 +37,7 @@ pub fn stage_disc_layout(
         BurnError::Other(format!("failed to create staging dir {}: {e}", root.display()))
     })?;
 
+    // Include GOG and synthetic local ids; only the invalid 0 sentinel is skipped.
     let folder_by_id: HashMap<u64, &PathBuf> = game_folders
         .iter()
         .filter(|(id, _)| *id != 0)

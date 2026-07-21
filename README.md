@@ -1,89 +1,106 @@
+<p align="center">
+  <img src="assets/icon-512.png" alt="gog-conjure logotype" width="160" height="160">
+</p>
+
 # gog-conjure
 
-Cross-platform desktop app that summons your owned [GOG](https://www.gog.com) games to a folder you choose.
+A desktop app for downloading the games you own on [GOG](https://www.gog.com) to a folder on your computer, and optionally burning them to DVD or Blu-ray discs.
 
-- Log in with GOG in a login window (authorize → app captures the code automatically)
-- Browse your library, checkbox-select OS/language installers and optional extras
-- Queue downloads with progress bars into `{download_root}/{Game Name}/`
-- Plan and burn multi-disc DVD / Blu-ray data sets (Linux `xorriso`, Windows IMAPI2, macOS `drutil`)
+It works on Linux, Windows, and macOS. You sign in with your GOG account, browse your library, pick what to download, and (if you want) plan how those files fit onto physical discs.
 
-## Why not “open my browser like SourceGit”?
+## What it does
 
-SourceGit/Gitea register a **localhost** OAuth redirect, so the system browser can bounce back to the app.
+- **Download your library** — Sign in, choose a download folder, then select games, installers (by OS and language), and extras. Downloads go into subfolders named after each game.
+- **Watch progress** — The Queue tab shows what is downloading and how far along each job is.
+- **Burn to disc** — Plan how games fit onto DVD or Blu-ray blanks, then burn them from the Burn tab. The app remembers what you have already downloaded or burned.
 
-GOG’s public Galaxy client only allows:
+You do not need the GOG Galaxy client for these workflows.
 
-`https://embed.gog.com/on_login_success?origin=client`
+## Getting started
 
-A localhost redirect returns `redirect_uri_mismatch`. So gog-conjure opens a **separate login process** with an embedded browser, uses that registered redirect, and reads `code=` from the navigation — no paste, and the main window stays open.
+### Install a release
 
-## Requirements
+Download a build for your system from the project’s [Releases](../../releases) page:
+
+| Platform | Typical assets |
+|----------|----------------|
+| Linux | AppImage, `.deb`, or raw binary (`x86_64` / `aarch64`) |
+| Windows | `.exe` (`x86_64` / `aarch64`) |
+| macOS | Raw binary (`aarch64` / `x86_64`) |
+
+On Linux, disc burning needs [xorriso](https://www.gnu.org/software/xorriso/). The Burn tab can install it for you, or you can install it yourself (for example `sudo apt install xorriso` on Debian/Ubuntu). Windows and macOS use built-in disc tools, so no extra burn software is required there.
+
+You also need a normal desktop session (not a headless server). On Linux, the login window needs WebKitGTK (often already present; on Debian/Ubuntu: `libwebkit2gtk-4.1-0`).
+
+### First run
+
+1. Open the app.
+2. Click **Login with GOG** and sign in in the window that appears. The app captures the login automatically — you do not paste a code.
+3. Choose a **download folder** if prompted (or set one from the top bar).
+4. Use the **Library** tab to browse your games.
+
+## Using the app
+
+### Download games
+
+1. On **Library**, find a game (search and filters help with large libraries).
+2. Open it and check the installers and extras you want, or check several games for a batch download.
+3. Click **Download** or **Download selected**.
+4. Follow progress on the **Queue** tab. Files land in `{your download folder}/{Game Name}/`.
+
+### Plan and burn discs
+
+If you want physical copies (backup or offline archive):
+
+1. On **Library**, select games and click **Plan**, or add already-downloaded games from the **Burn** tab.
+2. In the plan flow, pick a disc size (DVD / Blu-ray), filter by OS / language / extras if needed, and choose whether to download now or later. The estimate uses GOG’s file sizes, so downloads do not have to be finished yet.
+3. On **Burn**, add blank discs (**Add disc**), adjust sizes or settings per disc if you like, then **Plan** to pack the burn list onto those discs.
+4. When downloads for a disc are complete, click **Burn**. If a write fails, you can try again.
+
+Incomplete downloads are included in the layout plan, but **Burn** stays disabled until those files are ready. Volume labels default to short versions of the game titles (disc filesystem limit: 32 characters).
+
+## Why a separate login window?
+
+Many apps send you to the system browser and bounce back via `localhost`. GOG’s public client redirect is fixed to their own success page, so a localhost redirect is rejected. gog-conjure opens a small login window with an embedded browser, uses that allowed redirect, and reads the authorization code from the page navigation. Your main window stays open, and you do not paste anything by hand.
+
+## Build from source
+
+For developers or anyone compiling locally:
 
 - Rust 1.75+ (edition 2021)
-- Desktop session (X11 or Wayland)
-- **Linux:** WebKitGTK for the login window
-- **Linux (burning):** [`xorriso`](https://www.gnu.org/software/xorriso/) (libburnia). The Burn tab can install it for you via your distro’s package manager (`pkexec`/`sudo`), or you can place a binary at `vendor/xorriso` next to the app.
-- **Windows (burning):** Built-in [IMAPI2](https://learn.microsoft.com/en-us/windows/win32/imapi/burning-a-disc) (no extra install). Builds a temp ISO on disk, then burns it.
-- **macOS (burning):** Built-in [`drutil`](https://keith.github.io/xcode-man-pages/drutil.1.html) (DiscRecording). Stages a layout directory, then burns ISO9660 + Joliet.
+- Desktop session (X11 or Wayland on Linux)
+- **Linux:** WebKitGTK for login; `xorriso` for burning (or place a binary at `vendor/xorriso` next to the app)
+- **Windows burning:** IMAPI2 (built in)
+- **macOS burning:** `drutil` (built in)
 
 ```bash
-# Debian / Ubuntu
+# Debian / Ubuntu — runtime
 sudo apt install libwebkit2gtk-4.1-0 xorriso
-# building from source:
+# Debian / Ubuntu — build
 sudo apt install pkg-config build-essential libwebkit2gtk-4.1-dev libgtk-3-dev
-```
 
-## Run
-
-```bash
 cargo run --release
 ```
 
-Click **Login with GOG**, sign in in the popup, done.
-
-## Disc burn
-
-On the **Library** tab, check games and use **Download** / **Download selected**, or **Plan** for a simplified disc flow:
-
-1. **Plan** opens a modal: pick one media size for every disc, filter by OS / language / extras, and choose download now or later
-2. The estimate uses **GOG file sizes** (downloads do not need to be finished yet) and shows how many identical discs you need
-3. **Add to burn** creates those discs on the Burn tab (and optionally queues the filtered downloads)
-
-Already-downloaded games (and previously burned ones) also show on the **Burn** tab so you can add or re-add them anytime.
-
-Then on **Burn**:
-
-1. Add games to the burn list from **Downloaded** (or the Library actions)
-2. **Add disc** for each blank you have — each disc can use a different media size and its own burn settings
-3. **Plan** — packs the burn list onto your discs as efficiently as possible using GOG/file sizes (optional GOG installer bin splitting). Incomplete downloads are included in the layout; **Burn** stays disabled until those downloads finish
-4. Click **Burn** on each disc when ready (reburn allowed if a write fails)
-
-Downloaded / burned status is remembered across sessions. Volume labels default to truncated game titles (ISO 9660, 32 characters).
-
-**Burn backends**
+### Burn backends (technical)
 
 | Platform | Backend | Notes |
 |----------|---------|--------|
-| Linux | `xorriso` | Path maps directly to the drive (no intermediate ISO). Search order: `vendor/xorriso` next to the binary, `xorriso` next to the binary, the same under the cwd, then `PATH`. |
-| Windows | IMAPI2 | Built into Windows. Stages a layout, streams a temp ISO to disk (bounded buffer — not held in RAM), then burns the ISO. Needs free disk space ≈ disc size. |
-| macOS | `drutil` | Built into macOS. Stages a layout directory, then `drutil burn -iso9660 -joliet …`. Simulate uses `-test`. |
+| Linux | `xorriso` | Writes via the drive path (no intermediate ISO). Search order: `vendor/xorriso` next to the binary, `xorriso` next to the binary, the same under the cwd, then `PATH`. |
+| Windows | IMAPI2 | Stages a layout, writes a temporary ISO to disk, then burns it. Needs free disk space about the size of the disc. |
+| macOS | `drutil` | Stages a layout directory, then burns ISO9660 + Joliet. Simulate uses `-test`. |
 
-## CI / releases
+## Releases and CI
 
-Pushing to `master` only runs build/test CI. Releases with attached binaries are created by the **Release** workflow when you push a version tag (or run it manually via `workflow_dispatch`):
+Pushes to `master` run build/test CI. Versioned releases with binaries are created by the **Release** workflow when you push a version tag (or run it manually):
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Workflows:
-
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) — GitHub assets:
-  - Linux `x86_64` / `aarch64`: raw binary, `.deb`, AppImage
-  - Windows `x86_64` / `aarch64`: `.exe`
-  - macOS `aarch64` / `x86_64`: raw binary
-- [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml) — Gitea Linux assets for the runner arch (binary + `.deb` + AppImage; shell-only Act workflow)
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) — GitHub assets for Linux, Windows, and macOS
+- [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml) — Gitea Linux assets for the runner arch
 
 ## License
 
