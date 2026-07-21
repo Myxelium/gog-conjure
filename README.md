@@ -59,9 +59,10 @@ If you want physical copies (backup or offline archive):
 
 Incomplete downloads are included in the layout plan, but **Burn** stays disabled until those files are ready. Volume labels default to short versions of the game titles (disc filesystem limit: 32 characters).
 
-## Why a separate login window?
+<img width="1180" height="792" alt="image" src="https://github.com/user-attachments/assets/8e3f147b-975a-492c-8250-05000590fae0" />
 
-Many apps send you to the system browser and bounce back via `localhost`. GOG’s public client redirect is fixed to their own success page, so a localhost redirect is rejected. gog-conjure opens a small login window with an embedded browser, uses that allowed redirect, and reads the authorization code from the page navigation. Your main window stays open, and you do not paste anything by hand.
+<img width="1281" height="865" alt="image" src="https://github.com/user-attachments/assets/d418cb97-d973-447e-a51b-52656ecbb885" />
+
 
 ## Build from source
 
@@ -101,6 +102,9 @@ git push origin v0.1.0
 
 - [`.github/workflows/release.yml`](.github/workflows/release.yml) — GitHub assets for Linux, Windows, and macOS
 - [`.gitea/workflows/release.yml`](.gitea/workflows/release.yml) — Gitea Linux assets for the runner arch
+
+## Heads up
+This software is mostly tested and built for my Linux Ubuntu operating system but should work for Windows and Mac but haven't been tested on those systems. Burning discs might be the failing point since I haven't tested that enough.
 
 ## License
 
