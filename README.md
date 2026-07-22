@@ -6,7 +6,7 @@
 
 A desktop app for downloading the games you own on [GOG](https://www.gog.com) to a folder on your computer, and optionally burning them to DVD or Blu-ray discs.
 
-It works on Linux, Windows, and macOS. You sign in with your GOG account, browse your library, pick what to download, and (if you want) plan how those files fit onto physical discs.
+It works on Linux, Windows, and macOS. You sign in with your GOG account, browse your library, pick what to download, and (if you want) let the app automatically plan how those files fit onto physical discs.
 
 ## What it does
 
