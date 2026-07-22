@@ -10,9 +10,9 @@ It works on Linux, Windows, and macOS. You sign in with your GOG account, browse
 
 ## What it does
 
-- **Download your library** — Sign in, choose a download folder, then select games, installers (by OS and language), and extras. Downloads go into subfolders named after each game.
-- **Watch progress** — The Queue tab shows what is downloading and how far along each job is.
-- **Burn to disc** — Plan how games fit onto DVD or Blu-ray blanks, then burn them from the Burn tab. The app remembers what you have already downloaded or burned.
+- **Download your library** - Sign in, choose a download folder, then select games, installers (by OS and language), and extras. Downloads go into subfolders named after each game.
+- **Watch progress** - The Queue tab shows what is downloading and how far along each job is.
+- **Burn to disc** - Plan how games fit onto DVD or Blu-ray blanks, then burn them from the Burn tab. The app remembers what you have already downloaded or burned.
 
 You do not need the GOG Galaxy client for these workflows.
 
