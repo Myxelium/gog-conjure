@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="assets/icon-512.png" alt="gog-conjure logotype" width="160" height="160">
-  ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/myxelium/gog-conjure/total)
+  <img src="assets/icon-512.png" alt="gog-conjure logotype" width="160" height="160"><br>
+  <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/myxelium/gog-conjure/total">
 </p>
 
 # gog-conjure
