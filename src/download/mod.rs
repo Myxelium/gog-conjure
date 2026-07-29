@@ -1,3 +1,4 @@
+mod filename;
 mod path;
 
 pub use path::game_folder;
@@ -9,11 +10,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
+use reqwest::header::CONTENT_DISPOSITION;
 use reqwest::StatusCode;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::gog::{DownloadFile, GogClient};
+
+use self::filename::{filename_from_cdn_url, filename_from_content_disposition};
 
 #[derive(Debug, Clone)]
 pub struct QueueItem {
@@ -191,7 +195,23 @@ impl DownloadQueue {
         };
 
         tokio::fs::create_dir_all(&dest_dir).await?;
-        let dest_path = dest_dir.join(sanitize_filename::sanitize(&file.name));
+
+        // Resolve first so we can use GOG's exact CDN filename (extension + version).
+        // gameDetails `name` is only a display label and must not be used as the save name.
+        let cdn_url = client.resolve_downlink(&file.downlink).await?;
+        let mut real_name = filename_from_cdn_url(&cdn_url).context(
+            "CDN URL did not include a usable GOG filename — refusing to save under a made-up name",
+        )?;
+
+        {
+            let mut inner = self.inner.lock();
+            if let Some(item) = inner.items.iter_mut().find(|i| i.id == id) {
+                item.file.name = real_name.clone();
+                let _ = self.events.send(QueueEvent::Updated(item.clone()));
+            }
+        }
+
+        let mut dest_path = dest_dir.join(&real_name);
 
         let existing = tokio::fs::metadata(&dest_path)
             .await
@@ -208,8 +228,6 @@ impl DownloadQueue {
             }
             return Ok(());
         }
-
-        let cdn_url = client.resolve_downlink(&file.downlink).await?;
 
         // Prefer a clean full download when the partial looks unusable.
         // GOG CDN often answers 416 for bad Range offsets (common on Windows .exe retries).
@@ -237,6 +255,26 @@ impl DownloadQueue {
                 }
             }
         };
+
+        // Prefer Content-Disposition when present — still the CDN's own name, never invented.
+        if resume_from == 0 {
+            if let Some(cd) = resp
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(filename_from_content_disposition)
+            {
+                if cd != real_name {
+                    real_name = cd;
+                    dest_path = dest_dir.join(&real_name);
+                    let mut inner = self.inner.lock();
+                    if let Some(item) = inner.items.iter_mut().find(|i| i.id == id) {
+                        item.file.name = real_name.clone();
+                        let _ = self.events.send(QueueEvent::Updated(item.clone()));
+                    }
+                }
+            }
+        }
 
         let content_len = resp.content_length().unwrap_or(0);
         let total = if resume_from > 0 && content_len > 0 {
