@@ -5,6 +5,95 @@ use serde::{Deserialize, Serialize};
 use super::media::DiscMedia;
 use crate::gog::format_bytes;
 
+/// Filesystem written for one disc. Joliet matches the historical burn path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DiscFilesystem {
+    #[default]
+    Joliet,
+    Udf,
+}
+
+impl DiscFilesystem {
+    pub fn label(self) -> &'static str {
+        match self {
+            DiscFilesystem::Joliet => "Joliet",
+            DiscFilesystem::Udf => "UDF",
+        }
+    }
+
+    /// `SetFileSystemsToCreate` choice. Joliet is ISO 9660 + Joliet, not a hybrid with UDF.
+    #[cfg(any(windows, test))]
+    pub fn imapi_filesystems(self) -> ImapiFileSystems {
+        match self {
+            DiscFilesystem::Joliet => ImapiFileSystems::Iso9660AndJoliet,
+            DiscFilesystem::Udf => ImapiFileSystems::Udf,
+        }
+    }
+}
+
+/// IMAPI filesystem set. Plain values so the choice can be tested without COM.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImapiFileSystems {
+    /// `FsiFileSystemISO9660 | FsiFileSystemJoliet`
+    Iso9660AndJoliet,
+    /// `FsiFileSystemUDF`
+    Udf,
+}
+
+/// Windows IMAPI rejects ISO 9660 / Joliet files at or above this size.
+pub const JOLIET_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `man xorriso`: it does not produce UDF filesystems, and 1.5.6 has no `-udf` command.
+/// `-udf on` is reported as `Not a known command: '-udf'` and then `'on'`.
+pub fn xorriso_udf_error() -> &'static str {
+    "Cannot burn with UDF: xorriso does not produce UDF filesystems. Choose Joliet. On Linux, Joliet with ISO 9660 level 3 stores files larger than 2 GiB."
+}
+
+/// True when any planned file is too large for Joliet, so the disc must use UDF.
+pub fn disc_needs_udf(disc: &DiscLayout) -> bool {
+    // Planned sizes only. Statting every file here runs on each UI frame.
+    disc.units.iter().any(|unit| {
+        unit.files
+            .iter()
+            .any(|file| file.size_bytes >= JOLIET_MAX_FILE_BYTES)
+    })
+}
+
+/// Error for a Joliet burn that contains a file ≥ 2 GiB. `None` when UDF is selected
+/// or every file is under the limit.
+pub fn joliet_file_limit_error(disc: &DiscLayout) -> Option<String> {
+    if disc.options.filesystem != DiscFilesystem::Joliet {
+        return None;
+    }
+    let file = disc
+        .units
+        .iter()
+        .flat_map(|unit| &unit.files)
+        .find(|file| effective_file_bytes(file) >= JOLIET_MAX_FILE_BYTES)?;
+    let name = if file.relative_name.is_empty() {
+        file.path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into())
+    } else {
+        file.relative_name.clone()
+    };
+    Some(format!(
+        "Cannot burn with Joliet: '{name}' is {} (≥ 2 GiB). Choose UDF.",
+        format_bytes(effective_file_bytes(file))
+    ))
+}
+
+fn effective_file_bytes(file: &BurnFile) -> u64 {
+    let on_disk = std::fs::metadata(&file.path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    file.size_bytes.max(on_disk)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SplitPolicy {
     /// Never split; oversized games block the plan.
@@ -179,8 +268,7 @@ impl DiscLayout {
 
     /// Usable bytes for planning/burning, honoring BD defect-management spare.
     pub fn usable_capacity_bytes(&self) -> u64 {
-        self.media
-            .capacity_for_burn(self.options.defect_management)
+        self.media.capacity_for_burn(self.options.defect_management)
     }
 
     pub fn used_label(&self) -> String {
@@ -219,7 +307,10 @@ impl DiscLayout {
         }
         if self.units.len() == 1 && self.units[0].is_split() {
             Some(self.units[0].part_index + 1)
-        } else if self.units.iter().all(|u| u.game_id == self.units[0].game_id)
+        } else if self
+            .units
+            .iter()
+            .all(|u| u.game_id == self.units[0].game_id)
             && self.units.iter().any(|u| u.is_split())
         {
             self.units.first().map(|u| u.part_index + 1)
@@ -252,7 +343,6 @@ pub struct BurnPlan {
     pub warnings: Vec<String>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BurnOptions {
     pub drive: String,
@@ -265,6 +355,9 @@ pub struct BurnOptions {
     /// BD-R/RE: format with Defect Management spare area (slower, less capacity).
     #[serde(default)]
     pub defect_management: bool,
+    /// Missing on older saved options, which stay Joliet.
+    #[serde(default)]
+    pub filesystem: DiscFilesystem,
 }
 
 impl Default for BurnOptions {
@@ -279,6 +372,7 @@ impl Default for BurnOptions {
             eject: true,
             // Off by default so nearly-full BD plans keep full media capacity.
             defect_management: false,
+            filesystem: DiscFilesystem::Joliet,
         }
     }
 }
@@ -292,9 +386,7 @@ pub struct OpticalDrive {
 
 impl OpticalDrive {
     pub fn label(&self) -> String {
-        let name = format!("{} {}", self.vendor, self.model)
-            .trim()
-            .to_string();
+        let name = format!("{} {}", self.vendor, self.model).trim().to_string();
         if name.is_empty() {
             self.path.clone()
         } else if self.path.len() > 28 {
@@ -303,5 +395,68 @@ impl OpticalDrive {
         } else {
             format!("{} — {}", self.path, name)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_burn_options_json_defaults_to_joliet() {
+        let opts: BurnOptions = serde_json::from_str(
+            r#"{"drive":"/dev/sr0","speed":null,"verify":false,"simulate":false,"blank":true,"eject":true}"#,
+        )
+        .unwrap();
+        assert_eq!(opts.filesystem, DiscFilesystem::Joliet);
+        assert!(!opts.defect_management);
+        assert_eq!(opts.drive, "/dev/sr0");
+    }
+
+    #[test]
+    fn windows_joliet_is_not_a_udf_hybrid() {
+        assert_eq!(
+            DiscFilesystem::Joliet.imapi_filesystems(),
+            ImapiFileSystems::Iso9660AndJoliet
+        );
+        assert_eq!(
+            DiscFilesystem::Udf.imapi_filesystems(),
+            ImapiFileSystems::Udf
+        );
+    }
+
+    #[test]
+    fn joliet_rejects_file_at_two_gib_and_names_udf() {
+        let disc = DiscLayout {
+            index: 0,
+            media: DiscMedia::Dvd5,
+            volid: "X".into(),
+            volid_manual: false,
+            units: vec![BurnUnit {
+                game_id: 1,
+                game_title: "Big".into(),
+                size_bytes: JOLIET_MAX_FILE_BYTES,
+                files: vec![BurnFile {
+                    path: PathBuf::from("missing-setup.bin"),
+                    relative_name: "setup.bin".into(),
+                    size_bytes: JOLIET_MAX_FILE_BYTES,
+                }],
+                part_index: 0,
+                part_count: 1,
+            }],
+            used_bytes: JOLIET_MAX_FILE_BYTES,
+            remaining_bytes: 0,
+            status: DiscBurnStatus::Planned,
+            last_error: None,
+            options: BurnOptions::default(),
+        };
+        let err = joliet_file_limit_error(&disc).unwrap();
+        assert!(err.contains("UDF"), "{err}");
+        assert!(err.contains("setup.bin"), "{err}");
+        assert!(disc_needs_udf(&disc));
+
+        let mut udf = disc;
+        udf.options.filesystem = DiscFilesystem::Udf;
+        assert!(joliet_file_limit_error(&udf).is_none());
     }
 }

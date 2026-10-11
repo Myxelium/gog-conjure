@@ -22,13 +22,14 @@ pub use windows_imapi::{
 };
 
 pub use burner::{create_burner, BurnEvent, DiscBurner};
-pub use history::{AvailableDownload, BurnHistory};
-pub use local_id::is_local_game_id;
+pub use history::{AvailableDownload, BurnHistory, BurnedDisc};
 pub use install::{install_xorriso, PackageManager};
+pub use local_id::is_local_game_id;
 pub use media::DiscMedia;
 pub use models::{
-    BurnListEntry, BurnOptions, BurnPlan, DiscBurnStatus, DiscLayout, DownloadReadiness,
-    OpticalDrive, SplitPolicy,
+    disc_needs_udf, joliet_file_limit_error, xorriso_udf_error, BurnListEntry, BurnOptions,
+    BurnPlan, DiscBurnStatus, DiscFilesystem, DiscLayout, DownloadReadiness, OpticalDrive,
+    SplitPolicy,
 };
 pub use pack::{
     folder_size, list_available_downloads, plan_homogeneous_discs, plan_into_discs,

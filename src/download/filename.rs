@@ -68,11 +68,7 @@ pub fn filename_from_content_disposition(header: &str) -> Option<String> {
 
 /// Keep the GOG name byte-for-byte, only rejecting path traversal / empty names.
 fn basename_if_usable(value: &str) -> Option<String> {
-    let name = value
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(value)
-        .trim();
+    let name = value.rsplit(['/', '\\']).next().unwrap_or(value).trim();
     if !is_usable_filename(name) {
         return None;
     }
@@ -175,7 +171,10 @@ mod tests {
 
     #[test]
     fn strips_path_components_keeps_basename() {
-        assert_eq!(basename_if_usable("../evil.exe").as_deref(), Some("evil.exe"));
+        assert_eq!(
+            basename_if_usable("../evil.exe").as_deref(),
+            Some("evil.exe")
+        );
         assert!(!is_usable_filename(".."));
         assert!(!is_usable_filename(""));
         assert!(!is_usable_filename("a/b.exe"));

@@ -19,23 +19,31 @@ impl PackageManager {
         let id = os_release_id().unwrap_or_default();
         let id = id.as_str();
 
-        if matches!(id, "debian" | "ubuntu" | "linuxmint" | "pop" | "elementary" | "raspbian")
-            && which("apt-get").is_some()
+        if matches!(
+            id,
+            "debian" | "ubuntu" | "linuxmint" | "pop" | "elementary" | "raspbian"
+        ) && which("apt-get").is_some()
         {
             return Some(Self::Apt);
         }
-        if matches!(id, "fedora" | "rhel" | "centos" | "rocky" | "almalinux" | "nobara")
-            && which("dnf").or_else(|| which("yum")).is_some()
+        if matches!(
+            id,
+            "fedora" | "rhel" | "centos" | "rocky" | "almalinux" | "nobara"
+        ) && which("dnf").or_else(|| which("yum")).is_some()
         {
             return Some(Self::Dnf);
         }
-        if matches!(id, "arch" | "manjaro" | "endeavouros" | "garuda" | "cachyos")
-            && which("pacman").is_some()
+        if matches!(
+            id,
+            "arch" | "manjaro" | "endeavouros" | "garuda" | "cachyos"
+        ) && which("pacman").is_some()
         {
             return Some(Self::Pacman);
         }
-        if matches!(id, "opensuse" | "opensuse-tumbleweed" | "opensuse-leap" | "suse")
-            && which("zypper").is_some()
+        if matches!(
+            id,
+            "opensuse" | "opensuse-tumbleweed" | "opensuse-leap" | "suse"
+        ) && which("zypper").is_some()
         {
             return Some(Self::Zypper);
         }
@@ -77,14 +85,7 @@ impl PackageManager {
     pub fn elevated_argv(self) -> Option<(String, Vec<String>)> {
         let pkg = self.package_name().to_string();
         let (inner_prog, mut inner_args) = match self {
-            Self::Apt => (
-                "apt-get".into(),
-                vec![
-                    "install".into(),
-                    "-y".into(),
-                    pkg,
-                ],
-            ),
+            Self::Apt => ("apt-get".into(), vec!["install".into(), "-y".into(), pkg]),
             Self::Dnf => {
                 let prog = which("dnf")
                     .map(|_| "dnf".into())
@@ -158,16 +159,13 @@ pub fn install_xorriso() -> Result<String, String> {
         })?;
 
         let display = format!("{prog} {}", args.join(" "));
-        let output = Command::new(&prog)
-            .args(&args)
-            .output()
-            .map_err(|e| {
-                format!(
-                    "Failed to start installer ({display}): {e}\n\
+        let output = Command::new(&prog).args(&args).output().map_err(|e| {
+            format!(
+                "Failed to start installer ({display}): {e}\n\
                      Try manually: {}",
-                    mgr.short_command()
-                )
-            })?;
+                mgr.short_command()
+            )
+        })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

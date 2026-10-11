@@ -34,6 +34,8 @@ pub struct GameDetails {
     pub id: u64,
     pub title: String,
     pub image: Option<String>,
+    /// Wide Galaxy / store backdrop. Cover stays in `image`.
+    pub background: Option<String>,
     pub installers: Vec<DownloadFile>,
     pub extras: Vec<DownloadFile>,
 }
@@ -82,6 +84,8 @@ impl GameDetails {
                     .map(|s| s.to_string())
             });
 
+        let background = background_from_value(&value);
+
         let mut installers = Vec::new();
         let mut extras = Vec::new();
 
@@ -95,9 +99,7 @@ impl GameDetails {
 
         if let Some(extra_list) = value.get("extras").and_then(|v| v.as_array()) {
             for (idx, extra) in extra_list.iter().enumerate() {
-                if let Some(file) =
-                    parse_file_node(extra, None, None, FileKind::Extra, idx)
-                {
+                if let Some(file) = parse_file_node(extra, None, None, FileKind::Extra, idx) {
                     extras.push(file);
                 }
             }
@@ -107,12 +109,50 @@ impl GameDetails {
             id,
             title,
             image,
+            background,
             installers,
             extras,
         };
         ensure_unique_ids(&mut details);
         Ok(details)
     }
+}
+
+/// Galaxy formatter on gamesdb `url_format` strings (`{formatter}` includes the underscore).
+const GAMESDB_BG_FORMATTER: &str = "_glx_bg_top_padding_7";
+
+/// Wide backdrop from a catalog or gameDetails payload.
+///
+/// Order: galaxy-specific keys, then `images.background` (the field on
+/// `https://api.gog.com/products/{id}`), then top-level `backgroundImage`.
+pub fn background_from_value(value: &Value) -> Option<String> {
+    fn nonempty(value: Option<&Value>) -> Option<String> {
+        value
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    nonempty(value.get("galaxyBackgroundImage"))
+        .or_else(|| nonempty(value.get("galaxy_background")))
+        .or_else(|| nonempty(value.pointer("/images/galaxyBackgroundImage")))
+        .or_else(|| nonempty(value.pointer("/images/galaxy_background")))
+        .or_else(|| nonempty(value.pointer("/images/background")))
+        .or_else(|| nonempty(value.get("backgroundImage")))
+}
+
+/// Galaxy background from `https://gamesdb.gog.com/platforms/gog/external_releases/{id}`.
+pub fn background_from_gamesdb(value: &Value) -> Option<String> {
+    let raw = value
+        .pointer("/game/background/url_format")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(
+        raw.replace("{formatter}", GAMESDB_BG_FORMATTER)
+            .replace("{ext}", "jpg"),
+    )
 }
 
 fn parse_download_block(block: &Value, block_idx: usize, out: &mut Vec<DownloadFile>) {
@@ -400,16 +440,27 @@ mod tests {
         assert_eq!(details.title, "Example Game");
         assert_eq!(details.installers.len(), 2);
         assert_eq!(details.extras.len(), 1);
-        assert!(details.installers.iter().any(|f| f.os.as_deref() == Some("windows")));
-        assert!(details.installers.iter().any(|f| f.os.as_deref() == Some("linux")));
-        assert!(details.installers[0].downlink.starts_with("https://embed.gog.com/"));
+        assert!(details
+            .installers
+            .iter()
+            .any(|f| f.os.as_deref() == Some("windows")));
+        assert!(details
+            .installers
+            .iter()
+            .any(|f| f.os.as_deref() == Some("linux")));
+        assert!(details.installers[0]
+            .downlink
+            .starts_with("https://embed.gog.com/"));
         assert!(details.installers.iter().any(|f| f.size > 1_000_000_000));
     }
 
     #[test]
     fn parse_human_sizes() {
         assert_eq!(parse_human_size("1024"), 1024);
-        assert_eq!(parse_human_size("1.5 GB"), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_human_size("1.5 GB"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
         assert_eq!(parse_human_size("800 MB"), 800 * 1024 * 1024);
     }
 
@@ -449,5 +500,83 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         );
         assert_eq!(details.installers.len(), 4);
+    }
+
+    #[test]
+    fn background_prefers_galaxy_then_images_background_then_embed_field() {
+        let galaxy = json!({
+            "title": "G",
+            "image": "cover-id",
+            "galaxyBackgroundImage": "//images.gog-statics.com/galaxy.jpg",
+            "images": { "background": "//images.gog-statics.com/store.jpg" },
+            "backgroundImage": "//images.gog-statics.com/embed.jpg"
+        });
+        let details = GameDetails::from_json(1, galaxy).unwrap();
+        assert_eq!(
+            details.background.as_deref(),
+            Some("//images.gog-statics.com/galaxy.jpg")
+        );
+
+        let store = json!({
+            "title": "S",
+            "images": { "background": "//images.gog-statics.com/store.jpg" },
+            "backgroundImage": "//images.gog-statics.com/embed.jpg"
+        });
+        assert_eq!(
+            GameDetails::from_json(2, store)
+                .unwrap()
+                .background
+                .as_deref(),
+            Some("//images.gog-statics.com/store.jpg")
+        );
+
+        let embed = json!({
+            "title": "E",
+            "image": "cover-id",
+            "backgroundImage": "//images.gog-statics.com/embed.jpg"
+        });
+        assert_eq!(
+            GameDetails::from_json(3, embed)
+                .unwrap()
+                .background
+                .as_deref(),
+            Some("//images.gog-statics.com/embed.jpg")
+        );
+
+        let cover_only = json!({ "title": "C", "image": "cover-id" });
+        assert_eq!(
+            GameDetails::from_json(4, cover_only).unwrap().background,
+            None
+        );
+
+        let product = json!({
+            "id": 1453375253,
+            "title": "Stardew Valley",
+            "images": {
+                "background": "//images-4.gog-statics.com/stardew-bg.jpg",
+                "logo": "//images-1.gog-statics.com/stardew_glx_logo.jpg"
+            }
+        });
+        assert_eq!(
+            background_from_value(&product).as_deref(),
+            Some("//images-4.gog-statics.com/stardew-bg.jpg")
+        );
+    }
+
+    #[test]
+    fn gamesdb_background_uses_galaxy_formatter() {
+        let value = json!({
+            "external_id": "1453375253",
+            "game": {
+                "background": {
+                    "url_format": "https://images.gog.com/abc{formatter}.{ext}?namespace=gamesdb"
+                }
+            }
+        });
+        assert_eq!(
+            background_from_gamesdb(&value).as_deref(),
+            Some("https://images.gog.com/abc_glx_bg_top_padding_7.jpg?namespace=gamesdb")
+        );
+        assert_eq!(background_from_gamesdb(&json!({})), None);
     }
 }

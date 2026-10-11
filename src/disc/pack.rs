@@ -135,7 +135,13 @@ pub fn plan_homogeneous_discs(
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
     let capacity = media.capacity_bytes();
-    let (chains, loose) = collect_units(entries, global_split, capacity, &mut blockers, &mut warnings);
+    let (chains, loose) = collect_units(
+        entries,
+        global_split,
+        capacity,
+        &mut blockers,
+        &mut warnings,
+    );
 
     if chains.is_empty() && loose.is_empty() {
         return BurnPlan {
@@ -148,6 +154,9 @@ pub fn plan_homogeneous_discs(
     let mut discs = pack_units(media, capacity, chains, loose);
     for disc in &mut discs {
         disc.options = options.clone();
+        if !media.blank_default() {
+            disc.options.blank = false;
+        }
     }
     assign_volids(&mut discs);
 
@@ -347,9 +356,7 @@ pub fn resolve_disc_file_paths(
     Ok(())
 }
 
-pub fn planned_files_from_download_files(
-    files: &[crate::gog::DownloadFile],
-) -> Vec<PlannedFile> {
+pub fn planned_files_from_download_files(files: &[crate::gog::DownloadFile]) -> Vec<PlannedFile> {
     files
         .iter()
         .map(|f| PlannedFile {
@@ -371,11 +378,7 @@ pub fn list_game_files(folder: &Path) -> std::io::Result<Vec<BurnFile>> {
     Ok(out)
 }
 
-fn list_game_files_inner(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<BurnFile>,
-) -> std::io::Result<()> {
+fn list_game_files_inner(root: &Path, dir: &Path, out: &mut Vec<BurnFile>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -442,7 +445,11 @@ fn order_for_split(files: Vec<BurnFile>) -> Vec<BurnFile> {
         }
     }
 
-    exes.sort_by(|a, b| a.relative_name.to_lowercase().cmp(&b.relative_name.to_lowercase()));
+    exes.sort_by(|a, b| {
+        a.relative_name
+            .to_lowercase()
+            .cmp(&b.relative_name.to_lowercase())
+    });
     bins.sort_by(|a, b| {
         let ka = bin_sort_key(
             Path::new(&a.relative_name)
@@ -773,7 +780,13 @@ mod tests {
         dir
     }
 
-    fn entry(id: u64, title: &str, folder: PathBuf, size: u64, policy: SplitPolicy) -> BurnListEntry {
+    fn entry(
+        id: u64,
+        title: &str,
+        folder: PathBuf,
+        size: u64,
+        policy: SplitPolicy,
+    ) -> BurnListEntry {
         BurnListEntry {
             game_id: id,
             title: title.into(),
@@ -925,7 +938,11 @@ mod tests {
         let discs = pack_units(media, 4_000, vec![], loose);
         assert_eq!(discs.len(), 2);
         assert!(discs.iter().all(|d| d.used_bytes <= 4_000));
-        let d0_titles: Vec<_> = discs[0].units.iter().map(|u| u.game_title.as_str()).collect();
+        let d0_titles: Vec<_> = discs[0]
+            .units
+            .iter()
+            .map(|u| u.game_title.as_str())
+            .collect();
         assert!(d0_titles.contains(&"Big"));
         assert!(d0_titles.contains(&"Tiny"));
     }

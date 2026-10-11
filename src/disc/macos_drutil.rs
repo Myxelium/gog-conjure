@@ -16,7 +16,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::burner::{BurnError, BurnEvent, DiscBurner};
-use super::models::{BurnOptions, DiscLayout, OpticalDrive};
+use super::models::{
+    joliet_file_limit_error, BurnOptions, DiscFilesystem, DiscLayout, OpticalDrive,
+};
 use super::stage::stage_disc_layout;
 use super::volid::{sanitize_volid, VOLID_MAX_LEN};
 
@@ -34,9 +36,7 @@ impl MacosBurner {
     }
 
     fn bin(&self) -> Result<&Path, BurnError> {
-        self.binary
-            .as_deref()
-            .ok_or(BurnError::BackendMissing)
+        self.binary.as_deref().ok_or(BurnError::BackendMissing)
     }
 }
 
@@ -83,7 +83,7 @@ impl DiscBurner for MacosBurner {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "drutil".into());
-        Ok(build_argv(&bin, disc, options, Path::new("<staged>")))
+        build_argv(&bin, disc, options, Path::new("<staged>"))
     }
 
     fn start_burn_job(
@@ -119,10 +119,7 @@ impl DiscBurner for MacosBurner {
 }
 
 fn find_drutil() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from(DRUTIL),
-        PathBuf::from("/usr/sbin/drutil"),
-    ];
+    let candidates = [PathBuf::from(DRUTIL), PathBuf::from("/usr/sbin/drutil")];
     for c in candidates {
         if c.is_file() {
             return Some(c);
@@ -164,12 +161,8 @@ fn run_burn_job(
     let _ = tx.send(BurnEvent::Log("Staging disc layout on disk…".into()));
     let staged = stage_disc_layout(disc, game_folders).map_err(|e| e.to_string())?;
 
-    let argv = build_argv(
-        &bin.display().to_string(),
-        disc,
-        options,
-        &staged.root,
-    );
+    let argv = build_argv(&bin.display().to_string(), disc, options, &staged.root)
+        .map_err(|err| err.to_string())?;
     let _ = tx.send(BurnEvent::Log(format!("Running: {}", argv.join(" "))));
     let _ = tx.send(BurnEvent::Progress {
         fraction: 0.20,
@@ -260,7 +253,11 @@ pub fn build_argv(
     disc: &DiscLayout,
     options: &BurnOptions,
     stage_path: &Path,
-) -> Vec<String> {
+) -> Result<Vec<String>, BurnError> {
+    if let Some(err) = joliet_file_limit_error(disc) {
+        return Err(BurnError::Other(err));
+    }
+
     let mut args = vec![binary.to_string()];
 
     // Drive selection must appear before the verb (see drutil(1)).
@@ -270,13 +267,26 @@ pub fn build_argv(
 
     args.push("burn".into());
 
-    // Filesystem: ISO9660 + Joliet (close to Linux xorriso joliet+iso9660).
-    args.extend([
-        "-iso9660".into(),
-        "-joliet".into(),
-        "-nohfsplus".into(),
-        "-noudf".into(),
-    ]);
+    // drutil(1): `-udf` / `-joliet` select a filesystem; `-nojoliet` / `-noudf` turn one off.
+    // Last option wins. UDF is UDF only (`-udf -nojoliet`), and HFS+ stays off.
+    match options.filesystem {
+        DiscFilesystem::Joliet => {
+            args.extend([
+                "-iso9660".into(),
+                "-joliet".into(),
+                "-nohfsplus".into(),
+                "-noudf".into(),
+            ]);
+        }
+        DiscFilesystem::Udf => {
+            args.extend([
+                "-udf".into(),
+                "-nojoliet".into(),
+                "-noiso9660".into(),
+                "-nohfsplus".into(),
+            ]);
+        }
+    }
 
     if options.simulate {
         args.push("-test".into());
@@ -303,7 +313,7 @@ pub fn build_argv(
     args.extend(["-disctitle".into(), volid]);
 
     args.push(stage_path.display().to_string());
-    args
+    Ok(args)
 }
 
 /// Parse `drutil list` into drives. Paths are 1-based indexes for `-drive N`.
@@ -395,7 +405,7 @@ fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::disc::media::DiscMedia;
-    use crate::disc::models::{BurnOptions, BurnUnit, DiscBurnStatus};
+    use crate::disc::models::{BurnOptions, BurnUnit, DiscBurnStatus, DiscFilesystem};
 
     #[test]
     fn parse_list_lines() {
@@ -441,26 +451,51 @@ mod tests {
             blank: true,
             eject: true,
             defect_management: false,
+            filesystem: DiscFilesystem::Joliet,
         };
-        let argv = build_argv("drutil", &disc, &opts, Path::new("/tmp/stage"));
+        let argv = build_argv("drutil", &disc, &opts, Path::new("/tmp/stage")).unwrap();
         assert!(argv.windows(2).any(|w| w[0] == "-drive" && w[1] == "1"));
         assert!(argv.contains(&"burn".into()));
         assert!(argv.contains(&"-iso9660".into()));
         assert!(argv.contains(&"-joliet".into()));
+        assert!(argv.contains(&"-noudf".into()));
+        assert!(argv.contains(&"-nohfsplus".into()));
         assert!(argv.contains(&"-erase".into()));
         assert!(argv.contains(&"-verify".into()));
         assert!(argv.contains(&"-eject".into()));
         assert!(argv.windows(2).any(|w| w[0] == "-speed" && w[1] == "4"));
-        assert!(argv.windows(2).any(|w| w[0] == "-disctitle" && w[1] == "MY_GAME"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-disctitle" && w[1] == "MY_GAME"));
         assert!(argv.iter().any(|a| a.ends_with("stage")));
 
+        let joliet = opts.clone();
+        let mut udf = opts.clone();
         let sim = BurnOptions {
             simulate: true,
             ..opts
         };
-        let argv_sim = build_argv("drutil", &disc, &sim, Path::new("/tmp/stage"));
+        let argv_sim = build_argv("drutil", &disc, &sim, Path::new("/tmp/stage")).unwrap();
         assert!(argv_sim.contains(&"-test".into()));
         assert!(!argv_sim.contains(&"-eject".into()));
+
+        udf.filesystem = DiscFilesystem::Udf;
+        let argv_udf = build_argv("drutil", &disc, &udf, Path::new("/tmp/stage")).unwrap();
+        assert!(argv_udf.contains(&"-udf".into()));
+        assert!(argv_udf.contains(&"-nojoliet".into()));
+        assert!(argv_udf.contains(&"-noiso9660".into()));
+        assert!(argv_udf.contains(&"-nohfsplus".into()));
+        assert!(!argv_udf.contains(&"-joliet".into()));
+        assert!(!argv_udf.contains(&"-noudf".into()));
+
+        let mut huge = disc.clone();
+        huge.units[0].files.push(crate::disc::models::BurnFile {
+            path: std::path::PathBuf::from("huge.bin"),
+            relative_name: "huge.bin".into(),
+            size_bytes: super::super::models::JOLIET_MAX_FILE_BYTES,
+        });
+        let err = build_argv("drutil", &huge, &joliet, Path::new("/tmp/stage")).unwrap_err();
+        assert!(err.to_string().contains("UDF"));
     }
 
     #[test]

@@ -1,11 +1,12 @@
-use egui::{RichText, ScrollArea, TextEdit, Ui};
+use egui::{ScrollArea, TextEdit, Ui};
 
 use crate::disc::{
-    is_local_game_id, sanitize_volid, AvailableDownload, BurnListEntry, BurnPlan, DiscBurnStatus,
-    DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive, SplitPolicy, VOLID_MAX_LEN,
+    disc_needs_udf, is_local_game_id, sanitize_volid, xorriso_udf_error, AvailableDownload,
+    BurnListEntry, BurnPlan, BurnedDisc, DiscBurnStatus, DiscFilesystem, DiscLayout, DiscMedia,
+    DownloadReadiness, OpticalDrive, SplitPolicy, VOLID_MAX_LEN,
 };
 use crate::gog::format_bytes;
-use crate::theme::{PRIMARY_BTN, SIDE_BTN};
+use crate::theme::{self, PRIMARY_BTN, SIDE_BTN};
 
 pub struct BurnPanel;
 
@@ -24,6 +25,7 @@ pub struct BurnPanelActions {
     pub add_all_available: Vec<usize>,
     pub install_xorriso: bool,
     pub new_disc_media: DiscMedia,
+    pub reburn: Option<usize>,
 }
 
 impl BurnPanel {
@@ -48,6 +50,7 @@ impl BurnPanel {
         installing_xorriso: bool,
         can_install_xorriso: bool,
         install_hint: Option<&str>,
+        burned_discs: &[BurnedDisc],
     ) -> BurnPanelActions {
         let mut actions = BurnPanelActions {
             plan: false,
@@ -63,12 +66,13 @@ impl BurnPanel {
             add_all_available: Vec::new(),
             install_xorriso: false,
             new_disc_media: *new_disc_media,
+            reburn: None,
         };
 
         ui.horizontal(|ui| {
-            ui.heading("Burn");
-            ui.weak("·");
-            ui.weak(backend_name);
+            ui.heading(theme::header("Burn"));
+            ui.label(theme::meta("·"));
+            ui.label(theme::meta(backend_name));
         });
         if let Some(reason) = unavailable {
             ui.colored_label(ui.visuals().warn_fg_color, reason);
@@ -88,7 +92,7 @@ impl BurnPanel {
                         actions.install_xorriso = true;
                     }
                     if let Some(hint) = install_hint {
-                        ui.weak(hint);
+                        ui.label(theme::meta(hint));
                     }
                 }
             });
@@ -159,18 +163,20 @@ impl BurnPanel {
                     let show_burn_progress =
                         burning || !burn_log.is_empty() || burn_progress.is_some();
                     let progress_footer_h = if show_burn_progress {
-                        let log_h = if burn_log.is_empty() { 0.0 } else { 140.0 };
-                        8.0 + 22.0 + 22.0 + log_h // separator + label + bar + optional log
+                        let log_h = if burn_log.is_empty() { 0.0 } else { 156.0 };
+                        // Glass card padding + label + bar + optional log.
+                        128.0 + log_h
                     } else {
                         0.0
                     };
 
                     if plan.discs.is_empty() {
-                        ui.add_space(24.0);
+                        ui.add_space(12.0);
                         ui.vertical_centered(|ui| {
-                            ui.weak("No discs yet.");
+                            ui.label(theme::meta("No discs yet."));
                             ui.label("Add a disc with the size you have, put games in the burn list, then Plan.");
                         });
+                        show_burned_discs(ui, burned_discs, burning, &mut actions.reburn);
                     } else {
                         let mut burn_clicked = None;
                         let mut download_disc = None;
@@ -184,27 +190,23 @@ impl BurnPanel {
                                 for (idx, disc) in plan.discs.iter_mut().enumerate() {
                                     // Keep index aligned with Vec position (burn_active_disc uses this).
                                     disc.index = idx;
-                                    egui::Frame::group(ui.style())
-                                        .inner_margin(egui::Margin::same(10))
-                                        .show(ui, |ui| {
-                                            let is_active =
-                                                burning && burn_active_disc == Some(idx);
-                                            let downloads_ready = disc.units.iter().all(|u| {
-                                                burn_list
-                                                    .iter()
-                                                    .find(|e| {
-                                                        e.game_id == u.game_id
-                                                            || e.title == u.game_title
-                                                    })
-                                                    .map(|e| {
-                                                        e.readiness == DownloadReadiness::Ready
-                                                    })
-                                                    .unwrap_or(true)
-                                            });
-                                            let need_download_count = disc_games_needing_download(
-                                                disc, burn_list,
-                                            )
-                                            .len();
+                                    let is_active = burning && burn_active_disc == Some(idx);
+                                    let downloads_ready = disc.units.iter().all(|u| {
+                                        burn_list
+                                            .iter()
+                                            .find(|e| {
+                                                e.game_id == u.game_id || e.title == u.game_title
+                                            })
+                                            .map(|e| e.readiness == DownloadReadiness::Ready)
+                                            .unwrap_or(true)
+                                    });
+                                    let need_download_count =
+                                        disc_games_needing_download(disc, burn_list).len();
+                                    let id = theme::hover_id(ui, ("disc", idx));
+                                    let hovered = theme::was_hovered(ui, id);
+                                    let shown =
+                                        theme::glass_card(hovered, is_active).show(ui, |ui| {
+                                            theme::expand_x(ui);
                                             show_disc_card(
                                                 ui,
                                                 disc,
@@ -222,8 +224,9 @@ impl BurnPanel {
                                                 &mut actions.refresh_drives,
                                             );
                                         });
-                                    ui.add_space(8.0);
+                                    theme::store_hover_rect(ui, id, shown.response.rect);
                                 }
+                                show_burned_discs(ui, burned_discs, burning, &mut actions.reburn);
                             });
                         actions.burn_disc = burn_clicked;
                         actions.download_disc = download_disc;
@@ -231,39 +234,40 @@ impl BurnPanel {
                     }
 
                     if show_burn_progress {
-                        ui.separator();
                         let disc_label = burn_active_disc
                             .map(|i| format!("Disc {} burn progress", i + 1))
                             .unwrap_or_else(|| "Burn progress".into());
-                        ui.label(RichText::new(disc_label).strong());
-                        if let Some(p) = burn_progress {
-                            let p = finite_unit_interval(p);
-                            let text = if burn_progress_text.is_empty() {
-                                format!("{:.0}%", p * 100.0)
-                            } else {
-                                format!("{:.0}% — {burn_progress_text}", p * 100.0)
-                            };
-                            let bar_w = ui.available_width().max(1.0);
-                            ui.add(
-                                egui::ProgressBar::new(p)
-                                    .desired_width(bar_w)
-                                    .text(text),
-                            );
-                        } else if burning {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Starting…");
-                            });
-                        }
-                        if !burn_log.is_empty() {
-                            ScrollArea::vertical()
-                                .id_salt("burn_log_scroll")
-                                .max_height(140.0)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    ui.monospace(burn_log);
+                        let id = theme::hover_id(ui, "burn_progress");
+                        let hovered = theme::was_hovered(ui, id);
+                        let shown = theme::glass_card(hovered, burning).show(ui, |ui| {
+                            theme::expand_x(ui);
+                            ui.label(theme::header(disc_label));
+                            if let Some(p) = burn_progress {
+                                let p = finite_unit_interval(p);
+                                let text = if burn_progress_text.is_empty() {
+                                    format!("{:.0}%", p * 100.0)
+                                } else {
+                                    format!("{:.0}% — {burn_progress_text}", p * 100.0)
+                                };
+                                let bar_w = ui.available_width().max(1.0);
+                                ui.add(theme::progress(p).desired_width(bar_w).text(text));
+                            } else if burning {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Starting…");
                                 });
-                        }
+                            }
+                            if !burn_log.is_empty() {
+                                ScrollArea::vertical()
+                                    .id_salt("burn_log_scroll")
+                                    .max_height(140.0)
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        ui.monospace(burn_log);
+                                    });
+                            }
+                        });
+                        theme::store_hover_rect(ui, id, shown.response.rect);
                     }
                 },
             );
@@ -294,7 +298,7 @@ fn show_available(
         .collect();
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Downloaded").strong());
+        ui.label(theme::header("Downloaded"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(egui::Button::new("Refresh").min_size(SIDE_BTN))
@@ -323,49 +327,57 @@ fn show_available(
     ui.add_space(4.0);
 
     if filtered.is_empty() {
-        ui.weak("No downloaded games found yet.");
+        ui.label(theme::meta("No downloaded games found yet."));
     } else {
         ScrollArea::vertical()
             .id_salt("available_dl_scroll")
-            .max_height(220.0)
+            .max_height(240.0)
             .show(ui, |ui| {
                 for (idx, game) in filtered {
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.vertical(|ui| {
-                                ui.set_max_width(ui.available_width() - SIDE_BTN.x - 8.0);
-                                ui.label(RichText::new(&game.title).strong());
-                                ui.horizontal(|ui| {
-                                    ui.weak(format_bytes(game.size_bytes));
-                                    if game.burned {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(80, 160, 100),
-                                            "Burned",
-                                        );
-                                    } else {
-                                        ui.weak("Downloaded");
+                    let id = theme::hover_id(ui, ("available", idx));
+                    let hovered = theme::was_hovered(ui, id);
+                    let row = theme::glass_row(hovered, false).show(ui, |ui| {
+                        theme::expand_x(ui);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_max_width(ui.available_width() - SIDE_BTN.x - 8.0);
+                                        ui.label(theme::header(&game.title));
+                                        ui.horizontal(|ui| {
+                                            ui.label(theme::meta(format_bytes(game.size_bytes)));
+                                            if game.burned {
+                                                ui.colored_label(theme::CYAN, "Burned");
+                                            } else {
+                                                ui.label(theme::meta("Downloaded"));
+                                            }
+                                            if game.on_burn_list {
+                                                ui.label(theme::meta("· in list"));
+                                            }
+                                        });
+                                    });
+                                },
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let label = if game.on_burn_list { "Re-add" } else { "Add" };
+                                    if ui
+                                        .add_enabled(
+                                            !burning,
+                                            egui::Button::new(label).min_size(SIDE_BTN),
+                                        )
+                                        .on_hover_text("Add this game to the burn list")
+                                        .clicked()
+                                    {
+                                        actions.add_available = Some(idx);
                                     }
-                                    if game.on_burn_list {
-                                        ui.weak("· in list");
-                                    }
-                                });
-                            });
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let label = if game.on_burn_list { "Re-add" } else { "Add" };
-                            if ui
-                                .add_enabled(
-                                    !burning,
-                                    egui::Button::new(label).min_size(SIDE_BTN),
-                                )
-                                .on_hover_text("Add this game to the burn list")
-                                .clicked()
-                            {
-                                actions.add_available = Some(idx);
-                            }
+                                },
+                            );
                         });
                     });
-                    ui.separator();
+                    theme::store_hover_rect(ui, id, row.response.rect);
                 }
             });
     }
@@ -379,8 +391,8 @@ fn show_burn_queue(
     burning: bool,
 ) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Burn list").strong());
-        ui.weak(format!("({})", burn_list.len()));
+        ui.label(theme::header("Burn list"));
+        ui.label(theme::meta(format!("({})", burn_list.len())));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add_enabled(
@@ -393,13 +405,14 @@ fn show_burn_queue(
             }
         });
     });
-    ui.weak("Games here are packed onto discs when you Plan.");
-    ui.add_space(4.0);
+    ui.label(theme::meta(
+        "Games here are packed onto discs when you Plan.",
+    ));
 
     if burn_list.is_empty() {
-        ui.weak(
+        ui.label(theme::meta(
             "Add downloads from the list above, or use Plan / Download in the Library.",
-        );
+        ));
         return;
     }
 
@@ -411,51 +424,57 @@ fn show_burn_queue(
         .show(ui, |ui| {
             let mut remove = None;
             for entry in burn_list.iter_mut() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut entry.included, "");
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width() - SIDE_BTN.x - 8.0);
-                        ui.label(RichText::new(&entry.title).strong());
-                        ui.horizontal(|ui| {
-                            let color = match entry.readiness {
-                                DownloadReadiness::Ready => ui.visuals().text_color(),
-                                DownloadReadiness::Failed => ui.visuals().error_fg_color,
-                                _ => ui.visuals().weak_text_color(),
-                            };
-                            ui.colored_label(color, entry.readiness.label());
-                            ui.weak(format_bytes(entry.size_bytes));
+                let id = theme::hover_id(ui, ("burn_list", entry.game_id));
+                let hovered = theme::was_hovered(ui, id);
+                let row = theme::glass_row(hovered, false).show(ui, |ui| {
+                    theme::expand_x(ui);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut entry.included, "");
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width() - SIDE_BTN.x - 8.0);
+                            ui.label(theme::header(&entry.title));
+                            ui.horizontal(|ui| {
+                                let color = match entry.readiness {
+                                    DownloadReadiness::Ready => theme::CYAN,
+                                    DownloadReadiness::Downloading => theme::TEXT_HEADER,
+                                    DownloadReadiness::Failed => ui.visuals().error_fg_color,
+                                    DownloadReadiness::Pending => theme::text_meta(),
+                                };
+                                ui.colored_label(color, entry.readiness.label());
+                                ui.label(theme::meta(format_bytes(entry.size_bytes)));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(theme::meta("Split"));
+                                let mut policy = entry.split_override.unwrap_or(*global_split);
+                                let prev = policy;
+                                egui::ComboBox::from_id_salt(format!("qsplit_{}", entry.game_id))
+                                    .selected_text(policy.label())
+                                    .width(170.0)
+                                    .show_ui(ui, |ui| {
+                                        for p in SplitPolicy::all() {
+                                            ui.selectable_value(&mut policy, *p, p.label());
+                                        }
+                                    });
+                                if policy != prev {
+                                    entry.split_override = Some(policy);
+                                }
+                            });
                         });
-                        ui.horizontal(|ui| {
-                            ui.weak("Split");
-                            let mut policy = entry.split_override.unwrap_or(*global_split);
-                            let prev = policy;
-                            egui::ComboBox::from_id_salt(format!("qsplit_{}", entry.game_id))
-                                .selected_text(policy.label())
-                                .width(170.0)
-                                .show_ui(ui, |ui| {
-                                    for p in SplitPolicy::all() {
-                                        ui.selectable_value(&mut policy, *p, p.label());
-                                    }
-                                });
-                            if policy != prev {
-                                entry.split_override = Some(policy);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !burning,
+                                    egui::Button::new("Remove").min_size(SIDE_BTN),
+                                )
+                                .on_hover_text("Remove from burn list")
+                                .clicked()
+                            {
+                                remove = Some(entry.game_id);
                             }
                         });
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui
-                            .add_enabled(
-                                !burning,
-                                egui::Button::new("Remove").min_size(SIDE_BTN),
-                            )
-                            .on_hover_text("Remove from burn list")
-                            .clicked()
-                        {
-                            remove = Some(entry.game_id);
-                        }
-                    });
                 });
-                ui.separator();
+                theme::store_hover_rect(ui, id, row.response.rect);
             }
             actions.remove_from_list = remove;
         });
@@ -471,12 +490,12 @@ fn show_discs_header(
     burning: bool,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Discs").strong());
-        ui.weak(format!("({})", plan.discs.len()));
+        ui.label(theme::header("Discs"));
+        ui.label(theme::meta(format!("({})", plan.discs.len())));
 
         egui::ComboBox::from_id_salt("new_disc_media")
             .selected_text(new_disc_media.short_label())
-            .width(90.0)
+            .width(120.0)
             .show_ui(ui, |ui| {
                 for m in DiscMedia::all() {
                     ui.selectable_value(new_disc_media, *m, m.label());
@@ -504,7 +523,7 @@ fn show_discs_header(
     });
 
     ui.horizontal(|ui| {
-        ui.weak("Default split");
+        ui.label(theme::meta("Default split"));
         egui::ComboBox::from_id_salt("global_split")
             .selected_text(global_split.label())
             .show_ui(ui, |ui| {
@@ -555,6 +574,59 @@ fn finite_unit_interval(v: f32) -> f32 {
         v.clamp(0.0, 1.0)
     } else {
         0.0
+    }
+}
+
+fn show_burned_discs(
+    ui: &mut Ui,
+    records: &[BurnedDisc],
+    burning: bool,
+    reburn: &mut Option<usize>,
+) {
+    if records.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(theme::header("Burned discs"));
+    ui.label(theme::meta(
+        "Reburn blanks a rewritable disc and writes a full new image from the current files.",
+    ));
+    for (idx, record) in records.iter().enumerate() {
+        let id = theme::hover_id(ui, ("burned", idx));
+        let hovered = theme::was_hovered(ui, id);
+        let row = theme::glass_row(hovered, false).show(ui, |ui| {
+            theme::expand_x(ui);
+            ui.horizontal_wrapped(|ui| {
+                let volid = if record.volid.is_empty() {
+                    "(no label)"
+                } else {
+                    record.volid.as_str()
+                };
+                ui.label(format!(
+                    "{volid} · {} · {}",
+                    record.media.short_label(),
+                    record.filesystem.label()
+                ));
+                if !record.titles.is_empty() {
+                    ui.label(theme::meta(record.titles.join(", ")));
+                }
+                if record.media.allows_reburn() {
+                    if ui
+                        .add_enabled(!burning, egui::Button::new("Reburn").min_size(SIDE_BTN))
+                        .on_hover_text(
+                            "Reload these games, keep this media type and filesystem, force Blank RW, and burn a new image.",
+                        )
+                        .clicked()
+                    {
+                        *reburn = Some(idx);
+                    }
+                } else {
+                    ui.label(theme::meta("Write-once — cannot reburn"));
+                }
+            });
+        });
+        theme::store_hover_rect(ui, id, row.response.rect);
     }
 }
 
@@ -612,20 +684,16 @@ fn show_disc_card_inner(
     refresh_drives: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("Disc {}", disc.index + 1))
-                .strong()
-                .size(16.0),
-        );
+        ui.label(theme::header(format!("Disc {}", disc.index + 1)).size(16.0));
         egui::ComboBox::from_id_salt(format!("media_{}", disc.index))
             .selected_text(disc.media.short_label())
-            .width(90.0)
+            .width(120.0)
             .show_ui(ui, |ui| {
                 for m in DiscMedia::all() {
-                    if ui
-                        .selectable_label(disc.media == *m, m.label())
-                        .clicked()
-                    {
+                    if ui.selectable_label(disc.media == *m, m.label()).clicked() {
+                        if *m != disc.media && m.is_mdisc() {
+                            disc.options.blank = false;
+                        }
                         disc.media = *m;
                         disc.recompute_usage();
                     }
@@ -638,7 +706,11 @@ fn show_disc_card_inner(
         } else {
             disc.status.label()
         };
-        ui.weak(status_text);
+        if is_active_burn {
+            ui.colored_label(theme::CYAN, status_text);
+        } else {
+            ui.label(theme::meta(status_text));
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add_enabled(!burning, egui::Button::new("Remove").min_size(SIDE_BTN))
@@ -651,19 +723,14 @@ fn show_disc_card_inner(
 
     // Capacity as text only — ProgressBar widgets were mistaken for burn progress
     // (and can visually "update" on every burn log repaint).
-    ui.label(RichText::new(disc.used_label()).weak());
+    ui.label(theme::meta(disc.used_label()));
     let fill = finite_unit_interval(disc.fill_fraction());
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width().max(1.0), 6.0),
+        egui::vec2(ui.available_width().max(1.0), 8.0),
         egui::Sense::hover(),
     );
     if ui.is_rect_visible(rect) {
-        let bg = ui.visuals().extreme_bg_color;
-        let fg = ui.visuals().widgets.inactive.bg_fill;
-        ui.painter().rect_filled(rect, 2.0, bg);
-        let mut filled = rect;
-        filled.set_width((rect.width() * fill).max(0.0));
-        ui.painter().rect_filled(filled, 2.0, fg);
+        theme::paint_meter(ui.painter(), rect, fill);
     }
 
     ui.horizontal(|ui| {
@@ -677,13 +744,14 @@ fn show_disc_card_inner(
             )
             .changed()
         {
-            disc.volid = sanitize_volid(&edit)
-                .chars()
-                .take(VOLID_MAX_LEN)
-                .collect();
+            disc.volid = sanitize_volid(&edit).chars().take(VOLID_MAX_LEN).collect();
             disc.volid_manual = true;
         }
-        ui.weak(format!("{}/{}", disc.volid.len(), VOLID_MAX_LEN));
+        ui.label(theme::meta(format!(
+            "{}/{}",
+            disc.volid.len(),
+            VOLID_MAX_LEN
+        )));
     });
 
     // Per-disc burn settings
@@ -729,6 +797,13 @@ fn show_disc_card_inner(
             });
     });
 
+    // IMAPI cannot store a file ≥ 2 GiB in Joliet. xorriso can: ISO 9660 level 3
+    // raises the file size limit, and xorriso has no UDF writer at all.
+    let xorriso_no_udf = cfg!(target_os = "linux");
+    let needs_udf = disc_needs_udf(disc) && !xorriso_no_udf;
+    if needs_udf {
+        disc.options.filesystem = DiscFilesystem::Udf;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut disc.options.verify, "Verify")
             .on_hover_text("Read back the disc after writing (MD5 check)");
@@ -736,8 +811,37 @@ fn show_disc_card_inner(
             .on_hover_text(
                 "Dry-run: build a temporary ISO only (does not write or eject the optical drive)",
             );
+        let fs_response = egui::ComboBox::from_id_salt(format!("fs_{}", disc.index))
+            .selected_text(disc.options.filesystem.label())
+            .width(80.0)
+            .show_ui(ui, |ui| {
+                ui.add_enabled_ui(!needs_udf, |ui| {
+                    ui.selectable_value(
+                        &mut disc.options.filesystem,
+                        DiscFilesystem::Joliet,
+                        "Joliet",
+                    );
+                });
+                ui.add_enabled_ui(!xorriso_no_udf, |ui| {
+                    ui.selectable_value(&mut disc.options.filesystem, DiscFilesystem::Udf, "UDF");
+                });
+            });
+        if needs_udf {
+            fs_response.response.on_hover_text(
+                "A file on this disc is ≥ 2 GiB. Joliet cannot store it, so UDF is required.",
+            );
+        } else if xorriso_no_udf {
+            fs_response.response.on_hover_text(
+                "xorriso does not write UDF. Joliet is the Linux filesystem, including for files ≥ 2 GiB.",
+            );
+        }
+        let blank_tip = if disc.media.is_mdisc() {
+            "M-DISC DVD is write-once and cannot be erased for reuse."
+        } else {
+            "Blank rewriteable media before writing (ignored in Simulate)"
+        };
         ui.checkbox(&mut disc.options.blank, "Blank RW")
-            .on_hover_text("Blank rewriteable media before writing (ignored in Simulate)");
+            .on_hover_text(blank_tip);
         ui.checkbox(&mut disc.options.eject, "Eject")
             .on_hover_text("Eject after a real burn (ignored in Simulate)");
         if disc.media.is_bluray() {
@@ -751,25 +855,28 @@ fn show_disc_card_inner(
             }
         }
     });
+    if needs_udf {
+        ui.label(theme::meta(
+            "Joliet is off because a file on this disc is ≥ 2 GiB. UDF is required.",
+        ));
+    } else if xorriso_no_udf && disc.options.filesystem == DiscFilesystem::Udf {
+        ui.label(theme::meta(xorriso_udf_error()));
+    }
 
     if is_active_burn {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Burn in progress — see Burn progress below.")
-                .strong()
-                .color(ui.visuals().warn_fg_color),
-        );
+        ui.label(theme::header("Burn in progress — see Burn progress below.").color(theme::CYAN));
     }
 
     if disc.units.is_empty() {
-        ui.weak("Empty — Plan will fill this disc from the burn list.");
+        ui.label(theme::meta(
+            "Empty — Plan will fill this disc from the burn list.",
+        ));
     } else {
-        ui.add_space(2.0);
         for unit in &disc.units {
             ui.horizontal(|ui| {
                 ui.label(unit.summary_label());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format_bytes(unit.size_bytes));
+                    ui.label(theme::meta(format_bytes(unit.size_bytes)));
                 });
             });
         }
@@ -829,14 +936,16 @@ fn show_disc_card_inner(
                 *download_clicked = Some(disc.index);
             }
         }
-        if ui
+        let burn_id = theme::hover_id(ui, ("burn_cta", disc.index));
+        let burn_hover = can_burn && theme::was_hovered(ui, burn_id);
+        let burn_response = ui
             .add_enabled(
                 can_burn,
-                egui::Button::new(RichText::new(label).strong()).min_size(PRIMARY_BTN),
+                theme::primary_button(label, burn_hover).min_size(PRIMARY_BTN),
             )
-            .on_hover_text(tip)
-            .clicked()
-        {
+            .on_hover_text(tip);
+        theme::store_hover_rect(ui, burn_id, burn_response.rect);
+        if burn_response.clicked() {
             *burn_clicked = Some(disc.index);
         }
     });

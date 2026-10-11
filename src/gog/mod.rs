@@ -44,6 +44,7 @@ impl GogClient {
         &self.http
     }
 
+    #[allow(dead_code)]
     pub fn auth(&self) -> &AuthState {
         &self.auth
     }
@@ -92,6 +93,46 @@ impl GogClient {
         let resp = self.bearer_get(&url).await?;
         let value: Value = resp.json().await?;
         Ok(GameDetails::from_json(id, value)?)
+    }
+
+    /// Wide art for the window background.
+    ///
+    /// Prefers `images.background` on `https://api.gog.com/products/{id}`, then the
+    /// Galaxy background on gamesdb (`game.background.url_format`).
+    pub async fn galaxy_background_url(&self, id: u64) -> Result<Option<String>> {
+        let product_url = format!("https://api.gog.com/products/{id}");
+        match self.get_json_public(&product_url).await {
+            Ok(value) => {
+                if let Some(url) = background_from_value(&value) {
+                    return Ok(Some(url));
+                }
+            }
+            Err(_) => {}
+        }
+
+        let gamesdb_url = format!("https://gamesdb.gog.com/platforms/gog/external_releases/{id}");
+        match self.get_json_public(&gamesdb_url).await {
+            Ok(value) => Ok(background_from_gamesdb(&value)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Catalog and gamesdb are public. Retry with the user token if the host refuses.
+    async fn get_json_public(&self, url: &str) -> Result<Value> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN {
+            let resp = self.bearer_get(url).await?;
+            return Ok(resp.json().await.with_context(|| format!("json {url}"))?);
+        }
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("GET {url}"))?;
+        Ok(resp.json().await.with_context(|| format!("json {url}"))?)
     }
 
     /// Resolve a GOG `downlink` endpoint into a direct CDN URL.
@@ -175,9 +216,7 @@ async fn read_body_limited(resp: reqwest::Response, max: u64) -> Result<bytes::B
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read downlink body")?;
         if (out.len() as u64) + (chunk.len() as u64) > max {
-            bail!(
-                "downlink response exceeded {max} bytes — refusing to buffer in memory"
-            );
+            bail!("downlink response exceeded {max} bytes — refusing to buffer in memory");
         }
         out.extend_from_slice(&chunk);
     }

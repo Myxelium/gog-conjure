@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -9,15 +9,16 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::auth::{self, AuthState, LoginOutcome};
 use crate::config::AppConfig;
 use crate::disc::{
-    create_burner, folder_size, install_xorriso, is_local_game_id, list_available_downloads,
-    plan_homogeneous_discs, plan_into_discs, planned_files_from_download_files,
-    resolve_disc_file_paths, AvailableDownload, BurnEvent, BurnHistory, BurnListEntry, BurnOptions,
-    BurnPlan, DiscBurner, DiscBurnStatus, DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive,
+    create_burner, folder_size, install_xorriso, is_local_game_id, joliet_file_limit_error,
+    list_available_downloads, plan_homogeneous_discs, plan_into_discs,
+    planned_files_from_download_files, resolve_disc_file_paths, xorriso_udf_error,
+    AvailableDownload, BurnEvent, BurnHistory, BurnListEntry, BurnOptions, BurnPlan,
+    DiscBurnStatus, DiscBurner, DiscLayout, DiscMedia, DownloadReadiness, OpticalDrive,
     PackageManager, SplitPolicy,
 };
 use crate::download::{game_folder, DownloadQueue, JobStatus, QueueEvent, QueueItem};
 use crate::gog::{DownloadFile, GameDetails, GogClient, LibraryGame};
-use crate::images::ImageCache;
+use crate::images::{cover_url_candidates, direct_image_url, CoverSize, ImageCache};
 use crate::theme;
 use crate::ui::{
     collect_filter_options, filter_details_files, BurnPanel, DownloadWhen, GameDetailPanel,
@@ -37,7 +38,17 @@ enum AsyncMsg {
     LoginDone(Result<(), String>),
     Image {
         url: String,
-        bytes: Result<Vec<u8>, String>,
+        image: Result<egui::ColorImage, String>,
+    },
+    /// Galaxy backdrop URL resolved off the UI thread. `Err` means the details fetch failed.
+    BackdropMeta {
+        id: u64,
+        result: Result<Option<String>, String>,
+    },
+    /// One finished blurred window texture, already decoded and blurred.
+    BackdropReady {
+        key: theme::BlurKey,
+        image: Result<egui::ColorImage, String>,
     },
     BatchQueued {
         ok: usize,
@@ -69,6 +80,12 @@ pub struct ConjureApp {
     details: Option<GameDetails>,
     selected_files: HashSet<String>,
     images: ImageCache,
+    /// Covers decoded off the UI thread, uploaded a few at a time.
+    cover_ready: VecDeque<(String, egui::ColorImage)>,
+    /// Galaxy backdrop URL per game, once gameDetails has been read. `None` means no backdrop field.
+    backdrop_urls: HashMap<u64, Option<String>>,
+    backdrop_fetching: HashSet<u64>,
+    backdrop_failed: HashSet<u64>,
     loading_library: bool,
     loading_details: bool,
     batch_queueing: bool,
@@ -138,6 +155,10 @@ impl ConjureApp {
             details: None,
             selected_files: HashSet::new(),
             images: ImageCache::default(),
+            cover_ready: VecDeque::new(),
+            backdrop_urls: HashMap::new(),
+            backdrop_fetching: HashSet::new(),
+            backdrop_failed: HashSet::new(),
             loading_library: false,
             loading_details: false,
             batch_queueing: false,
@@ -196,6 +217,7 @@ impl ConjureApp {
 
     fn load_details(&mut self, id: u64) {
         self.loading_details = true;
+        self.backdrop_failed.remove(&id);
         self.details = None;
         self.selected_files.clear();
         let client = self.client.clone();
@@ -213,7 +235,7 @@ impl ConjureApp {
         let client = self.client.clone();
         let tx = self.async_tx.clone();
         self.runtime.spawn(async move {
-            let bytes = async {
+            let fetched = async {
                 let resp = client
                     .http()
                     .get(&url)
@@ -222,10 +244,93 @@ impl ConjureApp {
                     .map_err(|e| e.to_string())?
                     .error_for_status()
                     .map_err(|e| e.to_string())?;
-                resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+                resp.bytes()
+                    .await
+                    .map(|b| b.to_vec())
+                    .map_err(|e| e.to_string())
             }
             .await;
-            let _ = tx.send(AsyncMsg::Image { url, bytes });
+            // JPEG decode is slow enough to freeze the window if it runs on the UI thread.
+            let image = match fetched {
+                Ok(bytes) => {
+                    tokio::task::spawn_blocking(move || crate::images::decode_cover(&bytes))
+                        .await
+                        .unwrap_or_else(|err| Err(err.to_string()))
+                }
+                Err(err) => Err(err),
+            };
+            let _ = tx.send(AsyncMsg::Image { url, image });
+        });
+    }
+
+    fn store_background_url(&mut self, id: u64, raw: Option<String>) {
+        let url = raw.as_deref().and_then(direct_image_url);
+        self.backdrop_fetching.remove(&id);
+        self.backdrop_failed.remove(&id);
+        self.backdrop_urls.insert(id, url);
+    }
+
+    fn remember_background(&mut self, id: u64, raw: Option<String>) {
+        self.store_background_url(id, raw);
+        if let Some(url) = self.backdrop_urls.get(&id).cloned().flatten() {
+            self.request_image(url);
+        }
+    }
+
+    /// Queue Galaxy backdrop fetches for the selected game, then visible sidebar rows.
+    fn prefetch_backdrops(&mut self, visible: &[u64]) {
+        let mut order = Vec::new();
+        if let Some(id) = self.selected_game {
+            order.push(id);
+        }
+        for id in visible {
+            if !order.contains(id) {
+                order.push(*id);
+            }
+        }
+        for id in order {
+            self.ensure_backdrop(id);
+        }
+    }
+
+    fn ensure_backdrop(&mut self, id: u64) {
+        if let Some(url) = self.backdrop_urls.get(&id).cloned() {
+            if let Some(url) = url {
+                self.request_image(url);
+            }
+            return;
+        }
+        if self.backdrop_fetching.contains(&id) || self.backdrop_failed.contains(&id) {
+            return;
+        }
+        self.backdrop_fetching.insert(id);
+        let client = self.client.clone();
+        let tx = self.async_tx.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .galaxy_background_url(id)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(AsyncMsg::BackdropMeta { id, result });
+        });
+    }
+
+    fn enqueue_blur(&mut self, job: theme::BlurJob) {
+        let tx = self.async_tx.clone();
+        let key = job.key;
+        self.runtime.spawn(async move {
+            let rendered = tokio::task::spawn_blocking(move || job.render()).await;
+            let msg = match rendered {
+                Ok(image) => AsyncMsg::BackdropReady {
+                    key,
+                    image: Ok(image),
+                },
+                Err(_) => AsyncMsg::BackdropReady {
+                    key,
+                    image: Err("blur worker stopped".into()),
+                },
+            };
+            let _ = tx.send(msg);
         });
     }
 
@@ -425,10 +530,7 @@ impl ConjureApp {
         // Folder equality as a safety net if ids ever diverge mid-session.
         for avail in &mut self.burn_available {
             if !avail.on_burn_list {
-                avail.on_burn_list = self
-                    .burn_list
-                    .iter()
-                    .any(|e| e.folder == avail.folder);
+                avail.on_burn_list = self.burn_list.iter().any(|e| e.folder == avail.folder);
             }
             avail.burned = self.burn_history.is_burned(avail.game_id);
         }
@@ -535,14 +637,7 @@ impl ConjureApp {
                         if add_to_burn {
                             burn_files.push((game_id, title.clone(), files.clone()));
                         }
-                        queue.enqueue(
-                            client.clone(),
-                            game_id,
-                            title,
-                            files,
-                            root.clone(),
-                            &handle,
-                        );
+                        queue.enqueue(client.clone(), game_id, title, files, root.clone(), &handle);
                         ok += 1;
                     }
                     Err(err) => {
@@ -731,7 +826,11 @@ impl ConjureApp {
         for mut disc in preview.discs {
             disc.index = start_index + disc.index;
             if disc.options.drive.is_empty() {
+                let blank = disc.options.blank;
+                let filesystem = disc.options.filesystem;
                 disc.options = self.burn_default_options.clone();
+                disc.options.blank = blank;
+                disc.options.filesystem = filesystem;
                 if disc.options.drive.is_empty() {
                     if let Some(first) = self.burn_drives.first() {
                         disc.options.drive = first.path.clone();
@@ -788,6 +887,7 @@ impl ConjureApp {
                 options.drive = first.path.clone();
             }
         }
+        options.blank = self.burn_new_media.blank_default();
         self.burn_plan
             .discs
             .push(DiscLayout::new_empty(index, self.burn_new_media, options));
@@ -860,9 +960,8 @@ impl ConjureApp {
             }
             Err(err) => {
                 self.burn_drives.clear();
-                self.status = format!(
-                    "Could not list optical drives (IMAPI). App will keep running. {err}"
-                );
+                self.status =
+                    format!("Could not list optical drives. App will keep running. {err}");
             }
         }
     }
@@ -882,10 +981,7 @@ impl ConjureApp {
         let mut jobs: Vec<(u64, String, Vec<String>)> = Vec::new();
         let mut seen = HashSet::new();
         for unit in &disc.units {
-            let entry = self
-                .burn_list
-                .iter()
-                .find(|e| e.game_id == unit.game_id);
+            let entry = self.burn_list.iter().find(|e| e.game_id == unit.game_id);
             let Some(entry) = entry else {
                 continue;
             };
@@ -955,22 +1051,13 @@ impl ConjureApp {
                                     .any(|n| n.eq_ignore_ascii_case(&f.name))
                             });
                         }
-                        files.retain(|f| {
-                            !active_keys.contains(&(game_id, f.name.to_lowercase()))
-                        });
+                        files.retain(|f| !active_keys.contains(&(game_id, f.name.to_lowercase())));
                         if files.is_empty() {
                             failed += 1;
                             errors.push(format!("{title}: no matching files to download"));
                             continue;
                         }
-                        queue.enqueue(
-                            client.clone(),
-                            game_id,
-                            title,
-                            files,
-                            root.clone(),
-                            &handle,
-                        );
+                        queue.enqueue(client.clone(), game_id, title, files, root.clone(), &handle);
                         ok += 1;
                     }
                     Err(err) => {
@@ -989,6 +1076,98 @@ impl ConjureApp {
                 switch_tab: false,
             });
         });
+    }
+
+    fn reburn_recorded_disc(&mut self, record_index: usize) {
+        if self.burn_rx.is_some() {
+            self.status = "A burn is already in progress.".into();
+            return;
+        }
+        let Some(record) = self.burn_history.discs.get(record_index).cloned() else {
+            return;
+        };
+        if !record.media.allows_reburn() {
+            self.status = "M-DISC DVD is write-once and cannot be reburned.".into();
+            return;
+        }
+
+        let mut entries = Vec::new();
+        for (i, game_id) in record.game_ids.iter().copied().enumerate() {
+            let title = record
+                .titles
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("game-{game_id}"));
+            let folder = self
+                .burn_list
+                .iter()
+                .find(|entry| entry.game_id == game_id)
+                .map(|entry| entry.folder.clone())
+                .or_else(|| {
+                    self.burn_available
+                        .iter()
+                        .find(|avail| avail.game_id == game_id)
+                        .map(|avail| avail.folder.clone())
+                });
+            let Some(folder) = folder else {
+                self.status = format!("Cannot reburn: missing folder for '{title}'.");
+                return;
+            };
+            if !folder.is_dir() {
+                self.status = format!(
+                    "Cannot reburn: folder not found for '{title}' ({}).",
+                    folder.display()
+                );
+                return;
+            }
+            entries.push(BurnListEntry {
+                game_id,
+                title,
+                folder: folder.clone(),
+                size_bytes: folder_size(&folder),
+                readiness: DownloadReadiness::Ready,
+                split_override: None,
+                included: true,
+                planned_files: Vec::new(),
+            });
+        }
+        if entries.is_empty() {
+            self.status = "Cannot reburn: this disc record has no games.".into();
+            return;
+        }
+
+        let mut options = self.burn_default_options.clone();
+        if options.drive.is_empty() {
+            if let Some(first) = self.burn_drives.first() {
+                options.drive = first.path.clone();
+            }
+        }
+        options.filesystem = record.filesystem;
+        options.blank = true;
+        options.simulate = false;
+        let plan =
+            plan_homogeneous_discs(record.media, &entries, SplitPolicy::WhenOversized, options);
+        if !plan.blockers.is_empty() {
+            self.status = format!("Cannot reburn: {}", plan.blockers.join(" · "));
+            return;
+        }
+        if plan.discs.len() != 1 {
+            self.status = format!(
+                "Cannot reburn: the current files no longer fit on one {} disc.",
+                record.media.short_label()
+            );
+            return;
+        }
+
+        let mut disc = plan.discs.into_iter().next().unwrap();
+        disc.volid = record.volid.clone();
+        disc.volid_manual = !record.volid.is_empty();
+        disc.options.filesystem = record.filesystem;
+        disc.options.blank = true;
+        let index = self.burn_plan.discs.len();
+        disc.index = index;
+        self.burn_plan.discs.push(disc);
+        self.start_disc_burn(index);
     }
 
     fn start_disc_burn(&mut self, disc_index: usize) {
@@ -1034,7 +1213,10 @@ impl ConjureApp {
             .collect();
         // Include available download folders for games not on list matching.
         for avail in &self.burn_available {
-            if !folders.iter().any(|(id, p)| *id == avail.game_id || p == &avail.folder) {
+            if !folders
+                .iter()
+                .any(|(id, p)| *id == avail.game_id || p == &avail.folder)
+            {
                 folders.push((avail.game_id, avail.folder.clone()));
             }
         }
@@ -1043,6 +1225,17 @@ impl ConjureApp {
         if let Err(err) = resolve_disc_file_paths(&mut disc, &folders) {
             self.status = format!("Cannot start burn: {err}");
             return;
+        }
+        if disc.options.filesystem == crate::disc::DiscFilesystem::Udf && cfg!(target_os = "linux")
+        {
+            self.status = xorriso_udf_error().into();
+            return;
+        }
+        if cfg!(not(target_os = "linux")) {
+            if let Some(err) = joliet_file_limit_error(&disc) {
+                self.status = err;
+                return;
+            }
         }
 
         let options = disc.options.clone();
@@ -1081,6 +1274,19 @@ impl ConjureApp {
             .start_burn_job(&disc, &options, &folders, tx, cancel);
     }
 
+    fn upload_ready_covers(&mut self, ctx: &egui::Context) {
+        const PER_FRAME: usize = 4;
+        for _ in 0..PER_FRAME {
+            let Some((url, image)) = self.cover_ready.pop_front() else {
+                break;
+            };
+            self.images.insert_decoded(ctx, url, image);
+        }
+        if !self.cover_ready.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
     fn poll_channels(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.async_rx.try_recv() {
             match msg {
@@ -1111,6 +1317,10 @@ impl ConjureApp {
                 }
                 AsyncMsg::Details(Err(err)) => {
                     self.loading_details = false;
+                    if let Some(id) = self.selected_game {
+                        self.backdrop_fetching.remove(&id);
+                        self.backdrop_failed.insert(id);
+                    }
                     self.status = format!("Details error: {err}");
                 }
                 AsyncMsg::LoginDone(Ok(())) => {
@@ -1122,11 +1332,20 @@ impl ConjureApp {
                     self.logging_in = false;
                     self.status = format!("Login failed: {err}");
                 }
-                AsyncMsg::Image { url, bytes } => match bytes {
-                    Ok(data) => {
-                        let _ = self.images.insert_bytes(ctx, url, &data);
-                    }
+                AsyncMsg::Image { url, image } => match image {
+                    Ok(image) => self.cover_ready.push_back((url, image)),
                     Err(_) => self.images.mark_failed(&url),
+                },
+                AsyncMsg::BackdropMeta { id, result } => match result {
+                    Ok(url) => self.remember_background(id, url),
+                    Err(_) => {
+                        self.backdrop_fetching.remove(&id);
+                        self.backdrop_failed.insert(id);
+                    }
+                },
+                AsyncMsg::BackdropReady { key, image } => match image {
+                    Ok(image) => theme::install_backdrop(ctx, key, image),
+                    Err(_) => theme::cancel_backdrop(ctx, key),
                 },
                 AsyncMsg::XorrisoInstall(result) => {
                     self.installing_xorriso = false;
@@ -1192,8 +1411,7 @@ impl ConjureApp {
                         }
                         self.library_plan.details = details;
                         // Keep preferred OS if present; otherwise All.
-                        let (oses, _) =
-                            collect_filter_options(&self.library_plan.details, None);
+                        let (oses, _) = collect_filter_options(&self.library_plan.details, None);
                         self.library_plan.available_os = oses;
                         if self.library_plan.os != "All"
                             && !self
@@ -1240,9 +1458,10 @@ impl ConjureApp {
         }
         let live = self.queue.items();
         if !live.is_empty()
-            || self.queue_items.iter().any(|i| {
-                matches!(i.status, JobStatus::Queued | JobStatus::Running)
-            })
+            || self
+                .queue_items
+                .iter()
+                .any(|i| matches!(i.status, JobStatus::Queued | JobStatus::Running))
         {
             self.queue_items = live;
         }
@@ -1287,15 +1506,23 @@ impl ConjureApp {
                                 "Burn finished.".into()
                             };
                             if was_simulate {
-                                self.status = format!(
-                                    "Disc {} simulate OK (no disc was written).",
-                                    idx + 1
-                                );
+                                self.status =
+                                    format!("Disc {} simulate OK (no disc was written).", idx + 1);
                             } else {
-                                let game_ids: Vec<u64> =
-                                    disc.units.iter().map(|u| u.game_id).collect();
+                                let mut game_ids = Vec::new();
+                                for unit in &disc.units {
+                                    if unit.game_id != 0 && !game_ids.contains(&unit.game_id) {
+                                        game_ids.push(unit.game_id);
+                                    }
+                                }
                                 self.status = format!("Disc {} burned successfully.", idx + 1);
-                                self.burn_history.mark_burned(game_ids);
+                                self.burn_history.record_disc(crate::disc::BurnedDisc {
+                                    volid: disc.volid.clone(),
+                                    media: disc.media,
+                                    filesystem: disc.options.filesystem,
+                                    game_ids,
+                                    titles: disc.game_titles(),
+                                });
                                 let _ = self.burn_history.save();
                                 self.refresh_available_downloads();
                             }
@@ -1310,10 +1537,161 @@ impl ConjureApp {
                 }
             }
         }
+
+        self.upload_ready_covers(ctx);
     }
 }
 
+fn show_tab(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
+    let selected = *current == tab;
+    let id = theme::hover_id(ui, label);
+    let hovered = theme::was_hovered(ui, id);
+    let response = ui.add(theme::nav_button(label, selected, hovered));
+    theme::store_hover_rect(ui, id, response.rect);
+    if response.clicked() {
+        *current = tab;
+    }
+}
+
+/// Leftover width in the top bar, after the title and nav tabs, before the folder
+/// control switches from its path text to an icon. The sidebar is already outside
+/// this panel on the Library tab, so this is the free space in the chrome itself.
+const PATH_BUTTON_TEXT_MIN: f32 = 160.0;
+
+#[derive(Default)]
+struct ChromeClicks {
+    logout: bool,
+    refresh: bool,
+    login: bool,
+    pick_folder: bool,
+}
+
+fn chrome_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::FontId::new(15.0, egui::FontFamily::Proportional);
+    let galley =
+        ui.fonts(|fonts| fonts.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE));
+    galley.size().x + theme::BUTTON_PADDING.x * 2.0 + 4.0
+}
+
+/// Width of Log out / Refresh (or Login) plus a folder icon. The path text is extra.
+fn chrome_actions_min_width(ui: &egui::Ui, logged_in: bool) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    let folder = chrome_button_width(ui, "📁");
+    if logged_in {
+        chrome_button_width(ui, "Log out") + gap + chrome_button_width(ui, "Refresh") + gap + folder
+    } else {
+        chrome_button_width(ui, "Login with GOG") + gap + folder
+    }
+}
+
+fn place_chrome_actions(ui: &mut egui::Ui, logged_in: bool, path: &str) -> ChromeClicks {
+    let mut clicks = ChromeClicks::default();
+    let clip = ui.available_rect_before_wrap();
+    ui.set_clip_rect(clip);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if logged_in {
+            if ui.button("Log out").clicked() {
+                clicks.logout = true;
+            }
+            if ui.button("Refresh").clicked() {
+                clicks.refresh = true;
+            }
+        } else if ui.button("Login with GOG").clicked() {
+            clicks.login = true;
+        }
+
+        let response = if ui.available_width() < PATH_BUTTON_TEXT_MIN {
+            ui.button("📁")
+        } else {
+            ui.add(egui::Button::new(path).truncate())
+        };
+        if response.on_hover_text(path).clicked() {
+            clicks.pick_folder = true;
+        }
+    });
+    clicks
+}
+
+enum BackdropChoice {
+    /// Blurred texture is ready to become the window background.
+    Image(std::sync::Arc<egui::ColorImage>),
+    /// No game selected, or nothing to hold onto yet.
+    Gradient,
+    /// Keep the previous blurred frame until the next one is ready.
+    Hold,
+}
+
+fn backdrop_choice(app: &ConjureApp) -> BackdropChoice {
+    let Some(id) = app.selected_game else {
+        return BackdropChoice::Gradient;
+    };
+    match app.backdrop_urls.get(&id) {
+        Some(Some(url)) => {
+            if let Some(pixels) = app.images.pixels(url) {
+                BackdropChoice::Image(std::sync::Arc::clone(pixels))
+            } else if app.images.has_failed(url) {
+                cover_backdrop(app, id)
+            } else {
+                BackdropChoice::Hold
+            }
+        }
+        Some(None) => cover_backdrop(app, id),
+        None => {
+            let waiting = app.backdrop_fetching.contains(&id)
+                || (app.loading_details && app.selected_game == Some(id));
+            if waiting {
+                BackdropChoice::Hold
+            } else {
+                cover_backdrop(app, id)
+            }
+        }
+    }
+}
+
+fn cover_backdrop(app: &ConjureApp, id: u64) -> BackdropChoice {
+    if let Some((_, pixels)) = selected_cover(app, id) {
+        BackdropChoice::Image(pixels)
+    } else {
+        BackdropChoice::Hold
+    }
+}
+
+fn selected_cover(
+    app: &ConjureApp,
+    id: u64,
+) -> Option<(egui::TextureHandle, std::sync::Arc<egui::ColorImage>)> {
+    let mut sources = Vec::new();
+    if let Some(game) = app.library.iter().find(|g| g.id == id) {
+        if let Some(image) = game.image.as_deref() {
+            sources.push(image.to_string());
+        }
+    }
+    if let Some(details) = app.details.as_ref().filter(|d| d.id == id) {
+        if let Some(image) = details.image.as_deref() {
+            if !sources.iter().any(|s| s == image) {
+                sources.push(image.to_string());
+            }
+        }
+    }
+    for image in &sources {
+        for size in [CoverSize::Large, CoverSize::Thumb] {
+            for url in cover_url_candidates(image, size) {
+                if let (Some(tex), Some(pixels)) =
+                    (app.images.texture(&url), app.images.pixels(&url))
+                {
+                    return Some((tex.clone(), std::sync::Arc::clone(pixels)));
+                }
+            }
+        }
+    }
+    None
+}
+
 impl eframe::App for ConjureApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::AMBIENT_TOP.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Scan optical drives only once the Burn tab is used — keeps a broken IMAPI stack
         // from taking down library/download flows at startup.
@@ -1323,148 +1701,194 @@ impl eframe::App for ConjureApp {
         }
         self.poll_channels(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        match backdrop_choice(self) {
+            BackdropChoice::Hold if theme::backdrop_is_showing(ctx) => {}
+            BackdropChoice::Image(pixels) => {
+                if let Some(job) = theme::sync_backdrop(ctx, theme::BackdropSource::Cover(&pixels))
+                {
+                    self.enqueue_blur(job);
+                }
+            }
+            BackdropChoice::Gradient | BackdropChoice::Hold => {
+                if let Some(job) = theme::sync_backdrop(ctx, theme::BackdropSource::Gradient) {
+                    self.enqueue_blur(job);
+                }
+            }
+        }
+        theme::paint_window_backdrop(ctx);
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(theme::BRAND);
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Library, "Library");
-                ui.selectable_value(&mut self.tab, Tab::Queue, "Queue");
-                ui.selectable_value(&mut self.tab, Tab::Burn, "Burn");
+        // Snapshot the tab so the sidebar and the page drawn this frame agree.
+        // Clicks in the top chrome apply on the next frame.
+        let frame_tab = self.tab;
+        let mut image_requests = Vec::new();
+        let mut visible_ids = Vec::new();
+        let mut download_selected = false;
+        let mut plan_selected = false;
+        let mut select_all = false;
+        let mut clear_checks = false;
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.auth.is_logged_in() {
-                        if ui.button("Log out").clicked() {
-                            let _ = self.auth.clear();
-                            self.library.clear();
-                            self.details = None;
-                            self.checked_games.clear();
-                            self.status = "Logged out.".into();
-                        }
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_library();
-                        }
-                    } else if ui.button("Login with GOG").clicked() {
-                        self.start_login();
+        if self.auth.is_logged_in() && frame_tab == Tab::Library {
+            egui::SidePanel::left("library_sidebar")
+                .resizable(true)
+                .default_width(440.0)
+                .width_range(340.0..=640.0)
+                .show_separator_line(false)
+                .frame(theme::sidebar_frame())
+                .show(ctx, |ui| {
+                    if self.loading_library {
+                        ui.spinner();
+                    }
+                    if self.batch_queueing {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Queueing selected games…");
+                        });
                     }
 
-                    let folder_label = self
-                        .config
-                        .download_root
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "Download folder…".into());
-                    if ui.button(folder_label).clicked() {
-                        self.pick_download_root();
+                    let prev = self.selected_game;
+                    let actions = LibraryPanel::show(
+                        ui,
+                        &self.library,
+                        &mut self.library_filter,
+                        &mut self.selected_game,
+                        &mut self.checked_games,
+                        &mut self.images,
+                        &mut |url| image_requests.push(url),
+                    );
+                    select_all = actions.select_all_filtered;
+                    clear_checks = actions.clear_checks;
+                    download_selected = actions.download_selected;
+                    plan_selected = actions.plan_selected;
+                    visible_ids = actions.visible_ids;
+
+                    if self.selected_game != prev {
+                        if let Some(id) = self.selected_game {
+                            self.load_details(id);
+                        }
                     }
                 });
+        }
+
+        egui::TopBottomPanel::top("top")
+            .show_separator_line(false)
+            .frame(theme::chrome_frame())
+            .show(ctx, |ui| {
+                let path_label = self
+                    .config
+                    .download_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "Download folder…".into());
+                let logged_in = self.auth.is_logged_in();
+                let mut placed = false;
+                let mut clicks = ChromeClicks::default();
+                ui.horizontal(|ui| {
+                    ui.heading(theme::header(theme::BRAND));
+                    ui.separator();
+                    show_tab(ui, &mut self.tab, Tab::Library, "Library");
+                    show_tab(ui, &mut self.tab, Tab::Queue, "Queue");
+                    show_tab(ui, &mut self.tab, Tab::Burn, "Burn");
+
+                    if chrome_actions_min_width(ui, logged_in) <= ui.available_width() {
+                        clicks = place_chrome_actions(ui, logged_in, &path_label);
+                        placed = true;
+                    }
+                });
+                if !placed {
+                    ui.horizontal(|ui| {
+                        clicks = place_chrome_actions(ui, logged_in, &path_label);
+                    });
+                }
+                if clicks.logout {
+                    let _ = self.auth.clear();
+                    self.library.clear();
+                    self.details = None;
+                    self.checked_games.clear();
+                    self.status = "Logged out.".into();
+                }
+                if clicks.refresh {
+                    self.refresh_library();
+                }
+                if clicks.login {
+                    self.start_login();
+                }
+                if clicks.pick_folder {
+                    self.pick_download_root();
+                }
+                if !self.status.is_empty() {
+                    ui.label(theme::meta(&self.status));
+                }
             });
-            if !self.status.is_empty() {
-                ui.small(&self.status);
-            }
-            ui.add_space(4.0);
-        });
 
         if !self.auth.is_logged_in() {
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default()
+                .frame(theme::content_frame())
+                .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.heading(theme::BRAND);
-                    ui.label(theme::TAGLINE);
-                    ui.add_space(20.0);
-                    let login_enabled = !self.logging_in;
-                    if ui
-                        .add_enabled(
-                            login_enabled,
-                            egui::Button::new(if self.logging_in {
+                    ui.add_space(48.0);
+                    theme::glass_card(false, false).show(ui, |ui| {
+                        ui.set_min_width(380.0);
+                        ui.vertical_centered(|ui| {
+                            ui.heading(theme::header(theme::BRAND));
+                            ui.label(theme::meta(theme::TAGLINE));
+                            ui.add_space(8.0);
+                            let login_enabled = !self.logging_in;
+                            let label = if self.logging_in {
                                 "Waiting for login…"
                             } else {
                                 "Login with GOG"
-                            })
-                            .min_size(theme::HERO_BTN),
-                        )
-                        .clicked()
-                    {
-                        self.start_login();
-                    }
+                            };
+                            let id = theme::hover_id(ui, "hero_login");
+                            let hovered = login_enabled && theme::was_hovered(ui, id);
+                            let response = ui.add_enabled(
+                                login_enabled,
+                                theme::primary_button(label, hovered).min_size(theme::HERO_BTN),
+                            );
+                            theme::store_hover_rect(ui, id, response.rect);
+                            if response.clicked() {
+                                self.start_login();
+                            }
 
-                    if self.logging_in {
-                        ui.add_space(16.0);
-                        ui.spinner();
-                        ui.label("Sign in inside the GOG login window.");
-                        ui.small("When authorization finishes, this app continues automatically.");
-                    }
+                            if self.logging_in {
+                                ui.add_space(8.0);
+                                ui.spinner();
+                                ui.label("Sign in inside the GOG login window.");
+                                ui.label(theme::meta(
+                                    "When authorization finishes, this app continues automatically.",
+                                ));
+                            }
+                        });
+                    });
                 });
             });
             return;
         }
 
-        match self.tab {
+        match frame_tab {
             Tab::Library => {
-                let mut image_requests = Vec::new();
-                let mut download_selected = false;
-                let mut plan_selected = false;
-                let mut select_all = false;
-                let mut clear_checks = false;
-
-                egui::SidePanel::left("library_panel")
-                    .resizable(true)
-                    .default_width(260.0)
-                    .width_range(200.0..=320.0)
+                egui::CentralPanel::default()
+                    .frame(theme::content_frame())
                     .show(ctx, |ui| {
-                        if self.loading_library {
-                            ui.spinner();
-                        }
-                        if self.batch_queueing {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Queueing selected games…");
-                            });
-                        }
-
-                        let prev = self.selected_game;
-                        let actions = LibraryPanel::show(
+                        let mut queued: Option<Vec<DownloadFile>> = None;
+                        let library_game = self
+                            .selected_game
+                            .and_then(|id| self.library.iter().find(|g| g.id == id));
+                        GameDetailPanel::show(
                             ui,
-                            &self.library,
-                            &mut self.library_filter,
-                            &mut self.selected_game,
-                            &mut self.checked_games,
+                            self.details.as_ref(),
+                            library_game,
+                            &mut self.selected_files,
+                            self.loading_details,
                             &mut self.images,
                             &mut |url| image_requests.push(url),
+                            &mut |files| queued = Some(files),
                         );
-                        select_all = actions.select_all_filtered;
-                        clear_checks = actions.clear_checks;
-                        download_selected = actions.download_selected;
-                        plan_selected = actions.plan_selected;
-
-                        if self.selected_game != prev {
-                            if let Some(id) = self.selected_game {
-                                self.load_details(id);
-                            }
+                        if let Some(files) = queued {
+                            self.enqueue_selected(files);
                         }
                     });
 
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut queued: Option<Vec<DownloadFile>> = None;
-                    let library_game = self
-                        .selected_game
-                        .and_then(|id| self.library.iter().find(|g| g.id == id));
-                    GameDetailPanel::show(
-                        ui,
-                        self.details.as_ref(),
-                        library_game,
-                        &mut self.selected_files,
-                        self.loading_details,
-                        &mut self.images,
-                        &mut |url| image_requests.push(url),
-                        &mut |files| queued = Some(files),
-                    );
-                    if let Some(files) = queued {
-                        self.enqueue_selected(files);
-                    }
-                });
-
+                self.prefetch_backdrops(&visible_ids);
                 for url in image_requests {
                     self.request_image(url);
                 }
@@ -1490,98 +1914,110 @@ impl eframe::App for ConjureApp {
                 }
             }
             Tab::Queue => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut cancel_id = None;
-                    let mut clear = false;
-                    QueuePanel::show(
-                        ui,
-                        &self.queue_items,
-                        &mut |id| cancel_id = Some(id),
-                        &mut || clear = true,
-                    );
-                    if let Some(id) = cancel_id {
-                        self.queue.cancel(id);
-                        self.queue_items = self.queue.items();
-                    }
-                    if clear {
-                        self.queue.clear_finished();
-                        self.queue_items = self.queue.items();
-                    }
-                });
+                egui::CentralPanel::default()
+                    .frame(theme::content_frame())
+                    .show(ctx, |ui| {
+                        let mut cancel_id = None;
+                        let mut clear = false;
+                        QueuePanel::show(
+                            ui,
+                            &self.queue_items,
+                            &mut |id| cancel_id = Some(id),
+                            &mut || clear = true,
+                        );
+                        if let Some(id) = cancel_id {
+                            self.queue.cancel(id);
+                            self.queue_items = self.queue.items();
+                        }
+                        if clear {
+                            self.queue.clear_finished();
+                            self.queue_items = self.queue.items();
+                        }
+                    });
             }
             Tab::Burn => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let unavailable = self.burner.unavailable_reason();
-                    let burning = self.burn_rx.is_some();
-                    let pkg = PackageManager::detect();
-                    let can_install = cfg!(target_os = "linux")
-                        && !self.burner.is_available()
-                        && pkg.is_some()
-                        && !self.installing_xorriso;
-                    let install_hint = pkg.as_ref().map(|m| m.short_command());
-                    let actions = BurnPanel::show(
-                        ui,
-                        &self.burn_available,
-                        &mut self.burn_available_filter,
-                        &mut self.burn_new_media,
-                        &mut self.burn_split,
-                        &mut self.burn_list,
-                        &mut self.burn_plan,
-                        &self.burn_drives,
-                        self.burner.name(),
-                        self.burner.is_available(),
-                        unavailable.as_deref(),
-                        burning,
-                        self.burn_active_disc,
-                        &self.burn_log,
-                        self.burn_progress,
-                        &self.burn_progress_text,
-                        self.installing_xorriso,
-                        can_install,
-                        install_hint.as_deref(),
-                    );
+                egui::CentralPanel::default()
+                    .frame(theme::content_frame())
+                    .show(ctx, |ui| {
+                        let unavailable = self.burner.unavailable_reason();
+                        let burning = self.burn_rx.is_some();
+                        let pkg = PackageManager::detect();
+                        let can_install = cfg!(target_os = "linux")
+                            && !self.burner.is_available()
+                            && pkg.is_some()
+                            && !self.installing_xorriso;
+                        let install_hint = pkg.as_ref().map(|m| m.short_command());
+                        let actions = BurnPanel::show(
+                            ui,
+                            &self.burn_available,
+                            &mut self.burn_available_filter,
+                            &mut self.burn_new_media,
+                            &mut self.burn_split,
+                            &mut self.burn_list,
+                            &mut self.burn_plan,
+                            &self.burn_drives,
+                            self.burner.name(),
+                            self.burner.is_available(),
+                            unavailable.as_deref(),
+                            burning,
+                            self.burn_active_disc,
+                            &self.burn_log,
+                            self.burn_progress,
+                            &self.burn_progress_text,
+                            self.installing_xorriso,
+                            can_install,
+                            install_hint.as_deref(),
+                            &self.burn_history.discs,
+                        );
 
-                    if actions.install_xorriso {
-                        self.start_xorriso_install();
-                    }
-                    if actions.refresh_available {
-                        self.refresh_available_downloads();
-                    }
-                    if actions.add_disc {
-                        self.add_burn_disc();
-                    }
-                    if actions.plan {
-                        self.plan_burn_discs();
-                    }
-                    if actions.clear_list {
-                        self.burn_list.clear();
-                        self.refresh_available_downloads();
-                        self.status = "Burn list cleared.".into();
-                    }
-                    if actions.refresh_drives {
-                        self.refresh_burn_drives();
-                    }
-                    if let Some(game_id) = actions.remove_from_list {
-                        self.burn_list.retain(|e| e.game_id != game_id);
-                        self.refresh_available_downloads();
-                    }
-                    if let Some(idx) = actions.add_available {
-                        self.add_available_to_burn_list(idx);
-                    }
-                    if !actions.add_all_available.is_empty() {
-                        self.add_all_available_to_burn_list(&actions.add_all_available);
-                    }
-                    if let Some(idx) = actions.remove_disc {
-                        self.remove_burn_disc(idx);
-                    }
-                    if let Some(idx) = actions.download_disc {
-                        self.download_disc_games(idx);
-                    }
-                    if let Some(idx) = actions.burn_disc {
-                        self.start_disc_burn(idx);
-                    }
-                });
+                        if actions.install_xorriso {
+                            self.start_xorriso_install();
+                        }
+                        if actions.refresh_available {
+                            self.refresh_available_downloads();
+                        }
+                        if actions.add_disc {
+                            self.add_burn_disc();
+                        }
+                        if actions.plan {
+                            self.plan_burn_discs();
+                        }
+                        if actions.clear_list {
+                            self.burn_list.clear();
+                            self.refresh_available_downloads();
+                            self.status = "Burn list cleared.".into();
+                        }
+                        if actions.refresh_drives {
+                            self.refresh_burn_drives();
+                        }
+                        if let Some(game_id) = actions.remove_from_list {
+                            self.burn_list.retain(|e| e.game_id != game_id);
+                            self.refresh_available_downloads();
+                        }
+                        if let Some(idx) = actions.add_available {
+                            self.add_available_to_burn_list(idx);
+                        }
+                        if !actions.add_all_available.is_empty() {
+                            self.add_all_available_to_burn_list(&actions.add_all_available);
+                        }
+                        if let Some(idx) = actions.remove_disc {
+                            self.remove_burn_disc(idx);
+                        }
+                        if let Some(idx) = actions.download_disc {
+                            self.download_disc_games(idx);
+                        }
+                        if let Some(idx) = actions.burn_disc {
+                            self.start_disc_burn(idx);
+                        }
+                        if let Some(idx) = actions.reburn {
+                            self.reburn_recorded_disc(idx);
+                        }
+                    });
             }
+        }
+
+        if self.auth.is_logged_in() && frame_tab != Tab::Library {
+            self.prefetch_backdrops(&[]);
         }
 
         if self.library_plan.open {

@@ -34,7 +34,10 @@ pub fn stage_disc_layout(
         let _ = fs::remove_dir_all(&root);
     }
     fs::create_dir_all(&root).map_err(|e| {
-        BurnError::Other(format!("failed to create staging dir {}: {e}", root.display()))
+        BurnError::Other(format!(
+            "failed to create staging dir {}: {e}",
+            root.display()
+        ))
     })?;
 
     // Include GOG and synthetic local ids; only the invalid 0 sentinel is skipped.
@@ -101,7 +104,10 @@ pub fn stage_disc_layout(
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn simulate_iso_path(disc_index: usize) -> PathBuf {
-    std::env::temp_dir().join(format!("gog-conjure-simulate-disc{:02}.iso", disc_index + 1))
+    std::env::temp_dir().join(format!(
+        "gog-conjure-simulate-disc{:02}.iso",
+        disc_index + 1
+    ))
 }
 
 fn find_folder_by_title<'a>(
@@ -123,12 +129,11 @@ fn link_or_copy_tree(src: &Path, dest: &Path) -> Result<(), BurnError> {
     if dest.exists() {
         return Ok(());
     }
-    fs::create_dir_all(dest).map_err(|e| {
-        BurnError::Other(format!("failed to create {}: {e}", dest.display()))
-    })?;
-    for entry in fs::read_dir(src).map_err(|e| {
-        BurnError::Other(format!("failed to read {}: {e}", src.display()))
-    })? {
+    fs::create_dir_all(dest)
+        .map_err(|e| BurnError::Other(format!("failed to create {}: {e}", dest.display())))?;
+    for entry in fs::read_dir(src)
+        .map_err(|e| BurnError::Other(format!("failed to read {}: {e}", src.display())))?
+    {
         let entry = entry.map_err(|e| BurnError::Other(e.to_string()))?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
@@ -149,9 +154,8 @@ fn link_or_copy_file(src: &Path, dest: &Path) -> Result<(), BurnError> {
         return Ok(());
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            BurnError::Other(format!("failed to create {}: {e}", parent.display()))
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|e| BurnError::Other(format!("failed to create {}: {e}", parent.display())))?;
     }
     match fs::hard_link(src, dest) {
         Ok(()) => Ok(()),

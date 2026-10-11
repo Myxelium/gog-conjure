@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::media::DiscMedia;
+use super::models::DiscFilesystem;
 use crate::config::{load_json, save_json};
 
 /// Persisted burn / download memory across sessions.
@@ -12,6 +14,19 @@ pub struct BurnHistory {
     pub burned_game_ids: Vec<u64>,
     /// Games known to have been downloaded (folder may still exist).
     pub known_downloads: Vec<KnownDownload>,
+    /// Successful burns that can be written again onto rewritable media.
+    #[serde(default)]
+    pub discs: Vec<BurnedDisc>,
+}
+
+/// One finished burn. Old `burn_history.json` files omit this list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BurnedDisc {
+    pub volid: String,
+    pub media: DiscMedia,
+    pub filesystem: DiscFilesystem,
+    pub game_ids: Vec<u64>,
+    pub titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +48,11 @@ impl BurnHistory {
         self.burned_game_ids.iter().copied().collect()
     }
 
+    pub fn record_disc(&mut self, disc: BurnedDisc) {
+        self.mark_burned(disc.game_ids.iter().copied());
+        self.discs.push(disc);
+    }
+
     pub fn mark_burned(&mut self, game_ids: impl IntoIterator<Item = u64>) {
         let mut set = self.burned_set();
         for id in game_ids {
@@ -50,7 +70,11 @@ impl BurnHistory {
         if game_id == 0 {
             return;
         }
-        if let Some(existing) = self.known_downloads.iter_mut().find(|d| d.game_id == game_id) {
+        if let Some(existing) = self
+            .known_downloads
+            .iter_mut()
+            .find(|d| d.game_id == game_id)
+        {
             existing.title = title;
         } else {
             self.known_downloads.push(KnownDownload { game_id, title });
@@ -71,4 +95,20 @@ pub struct AvailableDownload {
     pub size_bytes: u64,
     pub burned: bool,
     pub on_burn_list: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_history_without_disc_records_still_loads() {
+        let history: BurnHistory = serde_json::from_str(
+            r#"{"burned_game_ids":[42],"known_downloads":[{"game_id":42,"title":"Terraria"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(history.burned_game_ids, vec![42]);
+        assert!(history.discs.is_empty());
+        assert_eq!(history.known_downloads[0].title, "Terraria");
+    }
 }

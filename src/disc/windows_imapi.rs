@@ -20,15 +20,15 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use windows::core::{BSTR, Interface, PCWSTR};
+use windows::core::{Interface, BSTR, PCWSTR};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::Storage::Imapi::{
-    IBurnVerification, IDiscFormat2Data, IDiscFormat2Erase, IDiscMaster2, IDiscRecorder2,
-    IFileSystemImage, IFsiDirectoryItem, FsiFileSystemISO9660, FsiFileSystemJoliet,
-    FsiFileSystemUDF, FsiFileSystems, IMAPI_BURN_VERIFICATION_FULL, IMAPI_BURN_VERIFICATION_NONE,
-    IMAPI_MEDIA_PHYSICAL_TYPE, IMAPI_MEDIA_TYPE_BDR, IMAPI_MEDIA_TYPE_DVDPLUSR,
-    IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER, MsftDiscFormat2Data, MsftDiscFormat2Erase,
-    MsftDiscMaster2, MsftDiscRecorder2, MsftFileSystemImage,
+    FsiFileSystemISO9660, FsiFileSystemJoliet, FsiFileSystemUDF, FsiFileSystems, IBurnVerification,
+    IDiscFormat2Data, IDiscFormat2Erase, IDiscMaster2, IDiscRecorder2, IFileSystemImage,
+    IFsiDirectoryItem, MsftDiscFormat2Data, MsftDiscFormat2Erase, MsftDiscMaster2,
+    MsftDiscRecorder2, MsftFileSystemImage, IMAPI_BURN_VERIFICATION_FULL,
+    IMAPI_BURN_VERIFICATION_NONE, IMAPI_MEDIA_PHYSICAL_TYPE, IMAPI_MEDIA_TYPE_BDR,
+    IMAPI_MEDIA_TYPE_CDR, IMAPI_MEDIA_TYPE_DVDPLUSR, IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IStream, CLSCTX_INPROC_SERVER,
@@ -43,7 +43,10 @@ pub const BURN_JOB_FLAG: &str = "--imapi-burn-job";
 
 use super::burner::{BurnError, BurnEvent, DiscBurner};
 use super::media::DiscMedia;
-use super::models::{BurnOptions, DiscLayout, OpticalDrive};
+use super::models::{
+    joliet_file_limit_error, BurnOptions, DiscFilesystem, DiscLayout, ImapiFileSystems,
+    OpticalDrive, JOLIET_MAX_FILE_BYTES,
+};
 use super::stage::{simulate_iso_path, stage_disc_layout};
 use super::volid::{sanitize_volid, VOLID_MAX_LEN};
 
@@ -60,18 +63,24 @@ struct BurnJobFile {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum HelperEvent {
-    Progress { fraction: f32, message: String },
-    Log { line: String },
-    Finished { ok: bool, #[serde(default)] error: Option<String> },
+    Progress {
+        fraction: f32,
+        message: String,
+    },
+    Log {
+        line: String,
+    },
+    Finished {
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 const CLIENT_NAME: &str = "gog-conjure";
 const STREAM_CHUNK: usize = 1024 * 1024; // 1 MiB — keeps peak RAM bounded
 const VARIANT_FALSE: VARIANT_BOOL = VARIANT_BOOL(0);
 const VARIANT_TRUE: VARIANT_BOOL = VARIANT_BOOL(-1);
-/// IMAPI caps ISO9660/Joliet at 2 GiB per file; Level 3 is not supported for raising that
-/// limit (see https://learn.microsoft.com/en-us/windows/win32/imapi/disc-formats). Use UDF.
-const IMAPI_ISO_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// `windows` 0.61 COM interfaces are `!Send`; IMAPI write cancellation is safe across
 /// threads for a single writer, so mark this wrapper explicitly.
@@ -190,6 +199,9 @@ fn run_burn_job(
     // Staging is pure filesystem work — keep it in-process.
     // All IMAPI COM runs in a child process so an AV cannot kill the UI.
     check_cancel(cancel)?;
+    if let Some(err) = joliet_file_limit_error(disc) {
+        return Err(err);
+    }
     let _ = tx.send(BurnEvent::Progress {
         fraction: 0.05,
         message: "Staging disc layout…".into(),
@@ -365,12 +377,23 @@ pub fn run_burn_job_helper(job_path: &Path) -> Result<(), String> {
         }
     });
 
+    if job.options.filesystem == DiscFilesystem::Joliet {
+        let largest = largest_file_bytes(&job.stage_root);
+        if largest >= JOLIET_MAX_FILE_BYTES {
+            return Err(format!(
+                "Cannot burn with Joliet: a staged file is {} bytes (≥ 2 GiB). Choose UDF.",
+                largest
+            ));
+        }
+    }
+
     let bridge = HelperProgress(progress_tx.clone());
     let com_result = with_com(|| {
         unsafe {
             build_iso_file(
                 &job.stage_root,
                 job.media,
+                job.options.filesystem,
                 &job.volid,
                 &job.iso_path,
                 &bridge,
@@ -497,10 +520,8 @@ fn with_com<T>(f: impl FnOnce() -> Result<T, BurnError>) -> Result<T, BurnError>
 /// Intentionally avoids `VolumePathNames` (SAFEARRAY of VARIANTs) — that property has
 /// hard-crashed this app; the unique recorder id is what burn re-opens with anyway.
 unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
-    let master: IDiscMaster2 =
-        CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_INPROC_SERVER).map_err(|e| {
-            BurnError::Other(format!("IMAPI DiscMaster2 unavailable: {e}"))
-        })?;
+    let master: IDiscMaster2 = CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_INPROC_SERVER)
+        .map_err(|e| BurnError::Other(format!("IMAPI DiscMaster2 unavailable: {e}")))?;
 
     // Same gate the platform exposes before IMAPI is usable on this machine.
     if let Ok(supported) = master.IsSupportedEnvironment() {
@@ -549,7 +570,11 @@ unsafe fn list_drives_com() -> Result<Vec<OpticalDrive>, BurnError> {
             (false, None) => format!("{product} {revision}"),
         };
 
-        drives.push(OpticalDrive { path, vendor, model });
+        drives.push(OpticalDrive {
+            path,
+            vendor,
+            model,
+        });
     }
     Ok(drives)
 }
@@ -583,7 +608,9 @@ fn largest_file_bytes(root: &Path) -> u64 {
 /// `ChooseImageDefaultsForMediaType` (see IMAPI_MEDIA_PHYSICAL_TYPE).
 fn imapi_media_type(media: DiscMedia) -> IMAPI_MEDIA_PHYSICAL_TYPE {
     match media {
-        DiscMedia::Dvd5 => IMAPI_MEDIA_TYPE_DVDPLUSR,
+        DiscMedia::Cd => IMAPI_MEDIA_TYPE_CDR,
+        // M-DISC DVD uses the same physical type as DVD-5.
+        DiscMedia::MDiscDvd | DiscMedia::Dvd5 => IMAPI_MEDIA_TYPE_DVDPLUSR,
         DiscMedia::Dvd9 => IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER,
         // IMAPI exposes BDR/BDRE only; capacity is set via FreeMediaBlocks.
         DiscMedia::Bd25 | DiscMedia::Bd50 | DiscMedia::Bd100 => IMAPI_MEDIA_TYPE_BDR,
@@ -593,6 +620,7 @@ fn imapi_media_type(media: DiscMedia) -> IMAPI_MEDIA_PHYSICAL_TYPE {
 unsafe fn build_iso_file(
     stage_root: &Path,
     media: DiscMedia,
+    filesystem: DiscFilesystem,
     volid: &str,
     iso_path: &Path,
     tx: &HelperProgress,
@@ -608,28 +636,23 @@ unsafe fn build_iso_file(
     )));
 
     // IMAPI2FS.MsftFileSystemImage — same object the Burning a Disc sample uses.
-    let fsi: IFileSystemImage =
-        CoCreateInstance(&MsftFileSystemImage, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| BurnError::Other(format!("MsftFileSystemImage: {e}")))?;
+    let fsi: IFileSystemImage = CoCreateInstance(&MsftFileSystemImage, None, CLSCTX_INPROC_SERVER)
+        .map_err(|e| BurnError::Other(format!("MsftFileSystemImage: {e}")))?;
 
     fsi.ChooseImageDefaultsForMediaType(imapi_media_type(media))
         .map_err(|e| BurnError::Other(format!("ChooseImageDefaultsForMediaType: {e}")))?;
 
-    // GOG installers often exceed 2 GiB. IMAPI's ISO9660/Joliet path returns
-    // IMAPI_E_DATA_TOO_BIG (0xC0AAB132) for those files — UDF is required.
-    let largest = largest_file_bytes(stage_root);
-    let filesystems = if largest >= IMAPI_ISO_MAX_FILE_BYTES {
-        tx.send(BurnEvent::Log(format!(
-            "Using UDF (largest file {:.2} GiB exceeds ISO9660/Joliet 2 GiB limit).",
-            largest as f64 / (1024.0 * 1024.0 * 1024.0)
-        )));
-        FsiFileSystems(FsiFileSystemUDF.0)
-    } else {
-        // Bridge image when every file fits ISO9660/Joliet.
-        FsiFileSystems(
-            FsiFileSystemISO9660.0 | FsiFileSystemJoliet.0 | FsiFileSystemUDF.0,
-        )
+    // Joliet is ISO 9660 + Joliet. UDF is UDF only. Files ≥ 2 GiB are rejected
+    // before this runs; IMAPI cannot raise the Joliet limit with ISO level 3.
+    let filesystems = match filesystem.imapi_filesystems() {
+        ImapiFileSystems::Udf => FsiFileSystems(FsiFileSystemUDF.0),
+        ImapiFileSystems::Iso9660AndJoliet => {
+            FsiFileSystems(FsiFileSystemISO9660.0 | FsiFileSystemJoliet.0)
+        }
     };
+    if filesystem == DiscFilesystem::Udf {
+        tx.send(BurnEvent::Log("Using UDF.".into()));
+    }
     fsi.SetFileSystemsToCreate(filesystems)
         .map_err(|e| BurnError::Other(format!("SetFileSystemsToCreate: {e}")))?;
 
@@ -768,14 +791,10 @@ unsafe fn burn_iso_file(
         fraction: 0.70,
         message: "Writing to disc…".into(),
     });
-    tx.send(BurnEvent::Log(format!(
-        "Burning ISO to {}…",
-        options.drive
-    )));
+    tx.send(BurnEvent::Log(format!("Burning ISO to {}…", options.drive)));
 
-    let data: IDiscFormat2Data =
-        CoCreateInstance(&MsftDiscFormat2Data, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| BurnError::Other(format!("MsftDiscFormat2Data: {e}")))?;
+    let data: IDiscFormat2Data = CoCreateInstance(&MsftDiscFormat2Data, None, CLSCTX_INPROC_SERVER)
+        .map_err(|e| BurnError::Other(format!("MsftDiscFormat2Data: {e}")))?;
     data.SetRecorder(&recorder)
         .map_err(|e| BurnError::Other(format!("SetRecorder: {e}")))?;
     data.SetClientName(&BSTR::from(CLIENT_NAME))

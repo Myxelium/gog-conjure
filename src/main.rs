@@ -1,5 +1,6 @@
 mod app;
 mod auth;
+mod backdrop;
 mod config;
 mod disc;
 mod download;

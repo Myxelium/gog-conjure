@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::burner::{BurnError, BurnEvent, DiscBurner};
-use super::models::{BurnOptions, DiscLayout, OpticalDrive};
+use super::models::{BurnOptions, DiscFilesystem, DiscLayout, OpticalDrive};
 use super::pack::iso_path_for;
 use super::volid::{sanitize_volid, VOLID_MAX_LEN};
 
@@ -34,9 +34,7 @@ impl XorrisoBurner {
     }
 
     fn bin(&self) -> Result<&Path, BurnError> {
-        self.binary
-            .as_deref()
-            .ok_or(BurnError::BackendMissing)
+        self.binary.as_deref().ok_or(BurnError::BackendMissing)
     }
 }
 
@@ -71,6 +69,13 @@ impl DiscBurner for XorrisoBurner {
     }
 
     fn list_drives(&self) -> Result<Vec<OpticalDrive>, BurnError> {
+        // A mounted disc makes `xorriso -devices` wait, then report no drives
+        // (`Cannot open busy device`). The kernel still lists the burner.
+        let sysfs = list_sysfs_optical_drives();
+        if !sysfs.is_empty() {
+            return Ok(sysfs);
+        }
+
         let bin = self.bin()?;
         let output = Command::new(bin)
             .arg("-devices")
@@ -81,7 +86,11 @@ impl DiscBurner for XorrisoBurner {
         let text = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{text}\n{stderr}");
-        Ok(parse_devices(&combined))
+        let mut drives = parse_devices(&combined);
+        if drives.is_empty() {
+            drives = parse_busy_devices(&combined);
+        }
+        Ok(drives)
     }
 
     fn build_burn_command(
@@ -178,6 +187,61 @@ fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Optical drives the kernel already knows about. Does not open the device,
+/// so a mounted disc still shows up.
+fn list_sysfs_optical_drives() -> Vec<OpticalDrive> {
+    let Ok(entries) = std::fs::read_dir("/sys/block") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("sr") && name[2..].chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let device = PathBuf::from("/sys/block").join(&name).join("device");
+            OpticalDrive {
+                path: format!("/dev/{name}"),
+                vendor: read_sysfs_line(&device.join("vendor")),
+                model: read_sysfs_line(&device.join("model")),
+            }
+        })
+        .collect()
+}
+
+fn read_sysfs_line(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// `xorriso -devices` names a mounted drive here instead of in the device list:
+/// `Cannot open busy device '/dev/sr0'`.
+fn parse_busy_devices(text: &str) -> Vec<OpticalDrive> {
+    let mut drives = Vec::new();
+    for line in text.lines() {
+        let Some(idx) = line.find("busy device") else {
+            continue;
+        };
+        let Some(path) = extract_quoted_after(&line[idx..], "busy device") else {
+            continue;
+        };
+        if drives.iter().any(|drive: &OpticalDrive| drive.path == path) {
+            continue;
+        }
+        drives.push(OpticalDrive {
+            path,
+            vendor: String::new(),
+            model: String::new(),
+        });
+    }
+    drives
+}
+
 /// Parse `xorriso -devices` output.
 pub fn parse_devices(text: &str) -> Vec<OpticalDrive> {
     let mut drives = Vec::new();
@@ -205,7 +269,11 @@ pub fn parse_devices(text: &str) -> Vec<OpticalDrive> {
                 model = quotes[1].to_string();
             }
         }
-        drives.push(OpticalDrive { path, vendor, model });
+        drives.push(OpticalDrive {
+            path,
+            vendor,
+            model,
+        });
     }
     drives
 }
@@ -251,6 +319,12 @@ pub fn build_argv(
         .filter(|(id, _)| *id != 0)
         .map(|(id, p)| (*id, p))
         .collect();
+    // xorriso(1) writes ISO 9660, Rock Ridge, Joliet, and HFS+. It has no UDF
+    // writer. Refuse before any command is built so `-udf on` is never sent.
+    if options.filesystem == DiscFilesystem::Udf {
+        return Err(BurnError::Other(super::models::xorriso_udf_error().into()));
+    }
+
     let volid = {
         let s = sanitize_volid(&disc.volid);
         if s.is_empty() {
@@ -266,15 +340,18 @@ pub fn build_argv(
         outdev,
         "-volid".into(),
         volid,
+    ];
+    // Joliet + Rock Ridge, ISO 9660 level 3. Level 3 is what lifts the file
+    // size limit (man xorriso: `-compliance iso_9660_level=3`).
+    args.extend([
         "-joliet".into(),
         "on".into(),
         "-rockridge".into(),
         "on".into(),
-        "-charset".into(),
-        "UTF-8".into(),
         "-compliance".into(),
         "iso_9660_level=3".into(),
-    ];
+    ]);
+    args.extend(["-charset".into(), "UTF-8".into()]);
 
     // MD5 tags enable post-burn verify via -check_media.
     if options.verify {
@@ -462,9 +539,7 @@ pub fn start_burn(
                             .unwrap_or_default();
                         // Write+eject can succeed, then a bad verify option fails the process.
                         // Don't report that as a total burn failure.
-                        if write_ok.load(Ordering::Relaxed)
-                            && is_post_write_only_failure(&detail)
-                        {
+                        if write_ok.load(Ordering::Relaxed) && is_post_write_only_failure(&detail) {
                             let _ = tx.send(BurnEvent::Finished(Ok(())));
                             let _ = tx.send(BurnEvent::Log(format!(
                                 "NOTE: disc write succeeded; post-write step failed: {detail}"
@@ -534,9 +609,7 @@ fn hint_for_xorriso_failure(detail: &str) -> String {
     if lower.contains("exceeds free space") {
         return " The image is larger than usable space on this disc — Plan again (BD capacities leave headroom), and use a fresh blank (already-formatted BD-R cannot regain spare area).".into();
     }
-    if lower.contains("invalid command operation code")
-        || lower.contains("cannot reserve track")
-    {
+    if lower.contains("invalid command operation code") || lower.contains("cannot reserve track") {
         return " The drive rejected a write command — confirm it can write BD-R (not read-only), then try a fresh blank disc.".into();
     }
     if detail.is_empty() {
@@ -636,7 +709,7 @@ fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::disc::media::DiscMedia;
-    use crate::disc::models::{BurnOptions, BurnUnit, DiscBurnStatus};
+    use crate::disc::models::{BurnOptions, BurnUnit, DiscBurnStatus, DiscFilesystem};
 
     #[cfg(unix)]
     #[test]
@@ -670,6 +743,26 @@ mod tests {
         assert_eq!(drives[0].path, "/dev/sr0");
         assert_eq!(drives[0].vendor, "ASUS");
         assert_eq!(drives[0].model, "BW-16D1HT");
+    }
+
+    #[test]
+    fn sysfs_drives_use_kernel_device_nodes() {
+        for drive in list_sysfs_optical_drives() {
+            assert!(drive.path.starts_with("/dev/sr"), "{}", drive.path);
+            assert!(drive.path[7..].chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    #[test]
+    fn mounted_drive_is_taken_from_the_busy_message() {
+        let text = "\
+libburn : SORRY : Cannot open busy device '/dev/sr0' : Device or resource busy
+xorriso : SORRY : No drives found
+";
+        assert!(parse_devices(text).is_empty());
+        let drives = parse_busy_devices(text);
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].path, "/dev/sr0");
     }
 
     #[test]
@@ -714,6 +807,7 @@ mod tests {
             blank: true,
             eject: true,
             defect_management: false,
+            filesystem: DiscFilesystem::Joliet,
         };
         let folders = vec![(1u64, game_dir.clone())];
         let argv = build_argv("xorriso", &disc, &opts, &folders).unwrap();
@@ -723,12 +817,19 @@ mod tests {
         assert!(argv.contains(&"4".into()));
         assert!(argv.contains(&"-blank".into()));
         assert!(argv.contains(&"-eject".into()));
-        assert!(argv.contains(&"-rockridge".into()));
+        assert!(argv.windows(2).any(|w| w[0] == "-joliet" && w[1] == "on"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-rockridge" && w[1] == "on"));
+        assert!(argv.contains(&"iso_9660_level=3".into()));
+        assert!(!argv.iter().any(|a| a == "-udf"));
         assert!(argv.contains(&"-md5".into()));
         assert!(!argv.iter().any(|a| a == "-write_type"));
         assert!(!argv.iter().any(|a| a == "-stream_recording"));
         assert!(!argv.iter().any(|a| a == "-format")); // DVD, not BD
-        assert!(argv.windows(2).any(|w| w[0] == "-check_media" && w[1] == "--"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-check_media" && w[1] == "--"));
         // Regression: old builds passed the invalid token "default".
         assert!(!argv.iter().any(|a| a == "default"));
         assert!(argv.contains(&"MY_GAME".into()));
@@ -761,6 +862,7 @@ mod tests {
             blank: true,
             eject: true,
             defect_management: false,
+            filesystem: DiscFilesystem::Joliet,
         };
         let argv_sim = build_argv("xorriso", &disc, &sim, &folders).unwrap();
         assert!(argv_sim.iter().any(|a| a.starts_with("stdio:")));
@@ -770,7 +872,35 @@ mod tests {
         assert!(!argv_sim.iter().any(|a| a == "-write_type"));
         assert!(!argv_sim.iter().any(|a| a == "-format"));
         assert!(!argv_sim.iter().any(|a| a == "default"));
-        assert!(argv_sim.windows(2).any(|w| w[0] == "-check_media" && w[1] == "--"));
+        assert!(argv_sim
+            .windows(2)
+            .any(|w| w[0] == "-check_media" && w[1] == "--"));
+
+        let mut udf_opts = opts.clone();
+        udf_opts.filesystem = DiscFilesystem::Udf;
+        let err = build_argv("xorriso", &disc, &udf_opts, &folders).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("xorriso does not produce UDF"), "{msg}");
+        assert!(!msg.contains("-udf"), "{msg}");
+
+        let mut cd_disc = disc.clone();
+        cd_disc.media = DiscMedia::Cd;
+        let argv_cd = build_argv("xorriso", &cd_disc, &opts, &folders).unwrap();
+        assert!(!argv_cd.iter().any(|a| a == "-format"));
+
+        let mut mdisc = disc.clone();
+        mdisc.media = DiscMedia::MDiscDvd;
+        let argv_mdisc = build_argv("xorriso", &mdisc, &opts, &folders).unwrap();
+        assert!(!argv_mdisc.iter().any(|a| a == "-format"));
+
+        let mut huge = disc.clone();
+        huge.units[0].files.push(crate::disc::models::BurnFile {
+            path: game_dir.join("huge.bin"),
+            relative_name: "huge.bin".into(),
+            size_bytes: super::super::models::JOLIET_MAX_FILE_BYTES,
+        });
+        let argv_huge = build_argv("xorriso", &huge, &opts, &folders).unwrap();
+        assert!(argv_huge.iter().any(|a| a == "iso_9660_level=3"));
 
         let _ = fs::remove_dir_all(&dir);
     }

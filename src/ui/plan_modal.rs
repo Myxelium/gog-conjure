@@ -1,7 +1,8 @@
-use egui::{ComboBox, RichText, ScrollArea, Ui};
+use egui::{ComboBox, ScrollArea, Ui};
 
 use crate::disc::{BurnPlan, DiscMedia};
 use crate::gog::{format_bytes, DownloadFile, GameDetails};
+use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtrasFilter {
@@ -112,10 +113,7 @@ impl LibraryPlanState {
         self.available_os = os;
         self.available_languages = langs;
         if self.language != FILTER_ALL
-            && !self
-                .available_languages
-                .iter()
-                .any(|l| l == &self.language)
+            && !self.available_languages.iter().any(|l| l == &self.language)
         {
             self.language = FILTER_ALL.into();
         }
@@ -151,7 +149,8 @@ impl PlanModal {
             .movable(true)
             .default_pos(center)
             .pivot(egui::Align2::CENTER_CENTER)
-            .default_width(440.0)
+            .default_width(520.0)
+            .frame(theme::modal_frame())
             .show(ctx, |ui| {
                 ui.label(format!(
                     "Plan {} selected game(s) onto identical discs using GOG file sizes.",
@@ -233,10 +232,10 @@ impl PlanModal {
                     });
                 });
                 if !state.available_languages.is_empty() {
-                    ui.weak(format!(
+                    ui.label(theme::meta(format!(
                         "{} language(s) available for current OS filter",
                         state.available_languages.len()
-                    ));
+                    )));
                 }
 
                 ui.horizontal(|ui| {
@@ -299,10 +298,10 @@ impl PlanModal {
                 } else if let Some(plan) = &state.preview {
                     show_preview(ui, plan, state.preview_total_bytes);
                 } else {
-                    ui.weak("No preview yet.");
+                    ui.label(theme::meta("No preview yet."));
                 }
 
-                ui.add_space(12.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         actions.cancel = true;
@@ -314,11 +313,13 @@ impl PlanModal {
                                 .preview
                                 .as_ref()
                                 .is_some_and(|p| !p.discs.is_empty() && p.blockers.is_empty());
-                        if ui
-                            .add_enabled(can_add, egui::Button::new("Add to burn"))
-                            .on_hover_text("Create these discs on the Burn tab")
-                            .clicked()
-                        {
+                        let id = theme::hover_id(ui, "plan_add_to_burn");
+                        let hovered = can_add && theme::was_hovered(ui, id);
+                        let response = ui
+                            .add_enabled(can_add, theme::primary_button("Add to burn", hovered))
+                            .on_hover_text("Create these discs on the Burn tab");
+                        theme::store_hover_rect(ui, id, response.rect);
+                        if response.clicked() {
                             actions.add_to_burn = true;
                         }
                     });
@@ -335,13 +336,10 @@ impl PlanModal {
 
 fn show_preview(ui: &mut Ui, plan: &BurnPlan, total_bytes: u64) {
     let filled = plan.discs.iter().filter(|d| !d.units.is_empty()).count();
-    ui.label(
-        RichText::new(format!(
-            "{filled} disc(s) · {} total",
-            format_bytes(total_bytes)
-        ))
-        .strong(),
-    );
+    ui.label(theme::header(format!(
+        "{filled} disc(s) · {} total",
+        format_bytes(total_bytes)
+    )));
 
     if !plan.blockers.is_empty() {
         ui.colored_label(
@@ -350,31 +348,35 @@ fn show_preview(ui: &mut Ui, plan: &BurnPlan, total_bytes: u64) {
         );
     }
     if !plan.warnings.is_empty() {
-        ui.weak(format!("{} notice(s)", plan.warnings.len()));
+        ui.label(theme::meta(format!("{} notice(s)", plan.warnings.len())));
     }
 
     ScrollArea::vertical()
-        .max_height(180.0)
+        .max_height(220.0)
         .id_salt("plan_modal_preview")
         .show(ui, |ui| {
             for disc in &plan.discs {
-                ui.group(|ui| {
-                    ui.label(format!(
+                let id = theme::hover_id(ui, ("plan_disc", disc.index));
+                let hovered = theme::was_hovered(ui, id);
+                let row = theme::glass_row(hovered, false).show(ui, |ui| {
+                    theme::expand_x(ui);
+                    ui.label(theme::header(format!(
                         "Disc {} · {} · {}",
                         disc.index + 1,
                         disc.media.short_label(),
                         disc.used_label()
-                    ));
+                    )));
                     for title in disc.game_titles() {
-                        ui.weak(format!("· {title}"));
+                        ui.label(theme::meta(format!("· {title}")));
                     }
                 });
+                theme::store_hover_rect(ui, id, row.response.rect);
             }
             for b in &plan.blockers {
                 ui.colored_label(ui.visuals().error_fg_color, b);
             }
             for w in plan.warnings.iter().take(6) {
-                ui.weak(w);
+                ui.label(theme::meta(w));
             }
         });
 }
@@ -467,6 +469,7 @@ mod tests {
             id: 1,
             title: "Multi".into(),
             image: None,
+            background: None,
             installers: vec![
                 file("windows", "English"),
                 file("windows", "Deutsch"),
