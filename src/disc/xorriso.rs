@@ -610,10 +610,26 @@ fn tidy_progress_message(line: &str) -> String {
         return trimmed[idx + "UPDATE : ".len()..].trim().to_string();
     }
     if trimmed.len() > 120 {
-        format!("{}…", &trimmed[..117])
+        truncate_with_ellipsis(trimmed, 120)
     } else {
         trimmed.to_string()
     }
+}
+
+/// Shorten `s` to at most `max_bytes`, ending with `…`.
+/// The cut walks back to a UTF-8 boundary so indexing cannot panic.
+fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let ellipsis = '…';
+    let mut end = max_bytes.saturating_sub(ellipsis.len_utf8()).min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push(ellipsis);
+    out
 }
 
 #[cfg(test)]
@@ -776,5 +792,17 @@ mod tests {
             extract_xorriso_problem(line).as_deref(),
             Some("Cannot acquire drive '/dev/sr0'")
         );
+    }
+
+    #[test]
+    fn tidy_progress_message_keeps_char_boundary() {
+        // Byte 117 falls inside '…' (bytes 116..=118). The old `[..117]` slice panicked.
+        let mut line = "a".repeat(116);
+        line.push('…');
+        line.push_str(&"b".repeat(20));
+        assert!(!line.is_char_boundary(117));
+        let tidy = tidy_progress_message(&line);
+        assert!(tidy.ends_with('…'));
+        assert!(tidy.len() <= 120);
     }
 }

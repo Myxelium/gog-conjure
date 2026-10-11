@@ -1253,22 +1253,12 @@ impl ConjureApp {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     BurnEvent::Log(line) => {
-                        if !self.burn_log.is_empty() {
-                            self.burn_log.push('\n');
-                        }
-                        self.burn_log.push_str(&line);
-                        if self.burn_log.len() > 32_000 {
-                            let keep = self.burn_log.split_off(self.burn_log.len() - 24_000);
-                            self.burn_log = keep;
-                        }
+                        append_burn_log(&mut self.burn_log, &line);
                     }
                     BurnEvent::Progress { fraction, message } => {
                         self.burn_progress = Some(fraction);
                         self.burn_progress_text = message.clone();
-                        if !self.burn_log.is_empty() {
-                            self.burn_log.push('\n');
-                        }
-                        self.burn_log.push_str(&message);
+                        append_burn_log(&mut self.burn_log, &message);
                     }
                     BurnEvent::Finished(result) => {
                         burn_finished = Some(result);
@@ -1606,5 +1596,71 @@ impl eframe::App for ConjureApp {
                 self.confirm_library_plan();
             }
         }
+    }
+}
+
+const BURN_LOG_MAX_BYTES: usize = 32_000;
+const BURN_LOG_KEEP_BYTES: usize = 24_000;
+
+fn append_burn_log(log: &mut String, line: &str) {
+    if !log.is_empty() {
+        log.push('\n');
+    }
+    log.push_str(line);
+    trim_burn_log_tail(log, BURN_LOG_MAX_BYTES, BURN_LOG_KEEP_BYTES);
+}
+
+/// Keep the newest tail once `log` exceeds `max_bytes`.
+///
+/// `String::split_off` panics unless the index is a UTF-8 character boundary.
+/// Burn output includes multi-byte characters (the ellipsis in status lines,
+/// non-ASCII game titles), so a raw `len - keep` cut crashes the UI on the
+/// next disc once the log crosses 32KB. The burner thread keeps running.
+fn trim_burn_log_tail(log: &mut String, max_bytes: usize, keep_bytes: usize) {
+    if log.len() <= max_bytes {
+        return;
+    }
+    let mut cut = log.len().saturating_sub(keep_bytes);
+    while cut > 0 && !log.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut == 0 || cut >= log.len() {
+        return;
+    }
+    let keep = log.split_off(cut);
+    *log = keep;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_burn_log_tail;
+
+    #[test]
+    fn trim_burn_log_cuts_on_char_boundary() {
+        // 8000 ASCII bytes, a 3-byte ellipsis, then enough tail that
+        // `len - 24_000` lands on the ellipsis's middle byte.
+        let mut log = "a".repeat(8_000);
+        log.push('…');
+        log.push_str(&"b".repeat(23_998));
+        let naive = log.len() - 24_000;
+        assert!(log.len() > 32_000);
+        assert!(
+            !log.is_char_boundary(naive),
+            "fixture must reproduce the panic offset"
+        );
+
+        trim_burn_log_tail(&mut log, 32_000, 24_000);
+
+        assert!(log.is_char_boundary(0));
+        assert!(log.starts_with('…'));
+        assert!(log.len() <= 24_000 + '…'.len_utf8());
+        assert!(log.chars().all(|c| c == '…' || c == 'b'));
+    }
+
+    #[test]
+    fn trim_burn_log_leaves_short_logs_alone() {
+        let mut log = "disc 1 ok\n".to_string();
+        trim_burn_log_tail(&mut log, 32_000, 24_000);
+        assert_eq!(log, "disc 1 ok\n");
     }
 }

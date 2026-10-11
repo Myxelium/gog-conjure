@@ -369,10 +369,26 @@ fn parse_drutil_progress(line: &str) -> Option<(f32, String)> {
 fn tidy_line(line: &str) -> String {
     let t = line.trim();
     if t.len() > 120 {
-        format!("{}…", &t[..117])
+        truncate_with_ellipsis(t, 120)
     } else {
         t.to_string()
     }
+}
+
+/// Shorten `s` to at most `max_bytes`, ending with `…`.
+/// The cut walks back to a UTF-8 boundary so indexing cannot panic.
+fn truncate_with_ellipsis(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let ellipsis = '…';
+    let mut end = max_bytes.saturating_sub(ellipsis.len_utf8()).min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push(ellipsis);
+    out
 }
 
 #[cfg(test)]
@@ -445,5 +461,16 @@ mod tests {
         let argv_sim = build_argv("drutil", &disc, &sim, Path::new("/tmp/stage"));
         assert!(argv_sim.contains(&"-test".into()));
         assert!(!argv_sim.contains(&"-eject".into()));
+    }
+
+    #[test]
+    fn tidy_line_keeps_char_boundary() {
+        let mut line = "a".repeat(116);
+        line.push('…');
+        line.push_str(&"b".repeat(20));
+        assert!(!line.is_char_boundary(117));
+        let tidy = tidy_line(&line);
+        assert!(tidy.ends_with('…'));
+        assert!(tidy.len() <= 120);
     }
 }
