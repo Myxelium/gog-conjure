@@ -61,10 +61,9 @@ If you want physical copies (backup or offline archive):
 
 Incomplete downloads are included in the layout plan, but **Burn** stays disabled until those files are ready. Volume labels default to short versions of the game titles (disc filesystem limit: 32 characters).
 
-<img width="1180" height="792" alt="image" src="https://github.com/user-attachments/assets/8e3f147b-975a-492c-8250-05000590fae0" />
-
-<img width="1281" height="865" alt="image" src="https://github.com/user-attachments/assets/d418cb97-d973-447e-a51b-52656ecbb885" />
-
+<img width="1180" height="792" alt="Screenshot_20261012_115937" src="https://github.com/user-attachments/assets/7cf4a2ac-947f-44fd-8250-de259ea01ac2" />
+<img width="1180" height="792" alt="Screenshot_20261012_120113" src="https://github.com/user-attachments/assets/b71ff124-2ae2-4e8d-9286-f32c9c182f96" />
+<img width="1180" height="792" alt="Screenshot_20261012_120028" src="https://github.com/user-attachments/assets/af9a4807-ea60-4567-b89e-b6029d2767fc" />
 
 ## Build from source
 
